@@ -51,7 +51,7 @@ class MotionFormer(VisionTransformer):
 
         if self.ckpt_path is not None:
             check_if_file_exists_else_download(self.ckpt_path, FILE2URL)
-            ckpt = torch.load(self.ckpt_path, map_location='cpu')
+            ckpt = torch.load(self.ckpt_path, map_location='cpu', weights_only=False)
             mformer_ckpt2cfg = {
                 'ssv2_motionformer_224_16x4.pyth': 'motionformer_224_16x4.yaml',
                 'ssv2_joint_224_16x4.pyth': 'joint_224_16x4.yaml',

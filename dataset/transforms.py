@@ -383,6 +383,8 @@ class TemporalCropAndOffset(torch.nn.Module):
                 offset_label, offset_target = offset_sec, {'oos': is_oos, 'offset': offset_sec}
             item['targets']['offset_sec'] = offset_sec
             item['targets']['v_start_i_sec'] = v_start_i_sec
+            item['targets']['a_start_i_sec'] = v_start_i_sec + offset_sec
+            item['targets']['crop_duration_sec'] = self.crop_len_sec
             item['targets']['offset_label'] = offset_label
             # assert 'offset_target' not in item['targets'], f'{item["targets"]}. What passed it there?'
             item['targets']['offset_target'] = offset_target

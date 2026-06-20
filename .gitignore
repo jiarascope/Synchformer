@@ -9,3 +9,13 @@ temp
 *.pyth
 todel
 .vscode
+outputs/
+vis/
+checkpoints/
+*.mp4
+*.wav
+*.pt
+*.pth
+*.npy
+*.npz
+*.csv
