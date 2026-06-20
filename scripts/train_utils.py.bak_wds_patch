@@ -104,67 +104,44 @@ def get_transforms(cfg, which_transforms=['train', 'test']):
     return transforms
 
 
-def _plain_container(x):
-    """Convert OmegaConf containers to plain Python containers where possible."""
-    try:
-        from omegaconf import OmegaConf
-        if OmegaConf.is_config(x):
-            return OmegaConf.to_container(x, resolve=True)
-    except Exception:
-        pass
-    return x
-
-
 def get_datasets(cfg, transforms, which_datasets=['train', 'valid', 'test']):
     if not isinstance(which_datasets, (list, tuple)):
         which_datasets = [which_datasets]
-
     DatasetClass = get_obj_from_str(cfg.data.dataset.target)
-    ds_params = _plain_container(cfg.data.dataset.params)
-    ds_params = {} if ds_params is None else dict(ds_params)
-
-    load_fixed_offsets_on = ds_params.get('load_fixed_offsets_on', None)
-    vis_load_backend = ds_params.get('vis_load_backend', 'read_video')
-    if 'size_ratios' in ds_params and ds_params['size_ratios'] is not None:
-        size_ratios = ds_params['size_ratios']
+    load_fixed_offsets_on = cfg.data.dataset.params.load_fixed_offsets_on
+    vis_load_backend = cfg.data.dataset.params.vis_load_backend
+    if 'size_ratios' in cfg.data.dataset.params:
+        size_ratios = cfg.data.dataset.params.size_ratios
     else:
-        size_ratios = {d: ds_params.get('size_ratio', None) for d in which_datasets}
-
+        size_ratios = {d: cfg.data.dataset.params.size_ratio for d in which_datasets}
     vids_path = cfg.data.vids_path
-    attr_annot_path = ds_params.get('attr_annot_path', None)
-    max_attr_per_vid = ds_params.get('max_attr_per_vid', None)
-
-    # Forward all extra dataset params. Keep size_ratio/size_ratios handled per phase.
-    extra_params = {
-        k: v for k, v in ds_params.items()
-        if k not in {'size_ratio', 'size_ratios'}
-    }
-
-    def make_dataset(phase, transform):
-        kwargs = dict(
-            split=phase,
-            vids_dir=vids_path,
-            transforms=transform,
-            load_fixed_offsets_on=load_fixed_offsets_on,
-            vis_load_backend=vis_load_backend,
-            size_ratio=size_ratios[phase],
-            attr_annot_path=attr_annot_path,
-            max_attr_per_vid=max_attr_per_vid,
-        )
-        kwargs.update(extra_params)
-        return DatasetClass(**kwargs)
+    attr_annot_path = cfg.data.dataset.params.get('attr_annot_path', None)
+    max_attr_per_vid = cfg.data.dataset.params.get('max_attr_per_vid', None)
 
     datasets = dict()
     if 'train' in which_datasets:
-        datasets['train'] = make_dataset('train', transforms['train'])
+        datasets['train'] = DatasetClass(
+            split='train', vids_dir=vids_path, transforms=transforms['train'],
+            load_fixed_offsets_on=load_fixed_offsets_on, vis_load_backend=vis_load_backend,
+            size_ratio=size_ratios['train'], attr_annot_path=attr_annot_path,
+            max_attr_per_vid=max_attr_per_vid)
         logging.info(f'Loaded {len(datasets["train"])} train samples')
     if 'valid' in which_datasets:
-        datasets['valid'] = make_dataset('valid', transforms['test'])
+        datasets['valid'] = DatasetClass(
+            split='valid', vids_dir=vids_path, transforms=transforms['test'],
+            load_fixed_offsets_on=load_fixed_offsets_on, vis_load_backend=vis_load_backend,
+            size_ratio=size_ratios['valid'], attr_annot_path=attr_annot_path,
+            max_attr_per_vid=max_attr_per_vid)
         logging.info(f'Loaded {len(datasets["valid"])} valid samples')
     if 'test' in which_datasets:
-        datasets['test'] = make_dataset('test', transforms['test'])
+        datasets['test'] = DatasetClass(
+            split='test', vids_dir=vids_path, transforms=transforms['test'],
+            load_fixed_offsets_on=load_fixed_offsets_on, vis_load_backend=vis_load_backend,
+            size_ratio=size_ratios['test'], attr_annot_path=attr_annot_path,
+            max_attr_per_vid=max_attr_per_vid)
         logging.info(f'Loaded {len(datasets["test"])} test samples')
     return datasets
+
 
 def get_datasets_v2(cfg, which_datasets=['train', 'valid', 'test']):
     if not isinstance(which_datasets, (list, tuple)):
@@ -189,31 +166,21 @@ def get_batch_sizes(cfg, num_gpus=None):
 
 def get_loaders(cfg, datasets, batch_sizes):
     loaders = dict()
-    num_workers = int(cfg.training.num_workers)
-    persistent_workers = bool(cfg.training.get('persistent_workers', True)) if num_workers > 0 else False
-    prefetch_factor = cfg.training.get('prefetch_factor', None) if num_workers > 0 else None
-    pin_memory = bool(cfg.training.get('pin_memory', torch.cuda.is_available()))
-
     for phase, dataset in datasets.items():
         if dist.is_initialized():
             sampler = DistributedSampler(datasets[phase], shuffle=phase == 'train')
         else:
             sampler = None
 
-        batch_size = batch_sizes['train'] if phase == 'train' else batch_sizes['test']
-        loader_kwargs = dict(
-            batch_size=batch_size,
-            shuffle=(phase == 'train' and sampler is None),
-            sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-        )
-        if prefetch_factor is not None:
-            loader_kwargs['prefetch_factor'] = int(prefetch_factor)
-
-        loaders[phase] = DataLoader(dataset, **loader_kwargs)
+        if phase == 'train':
+            # NOTE: don't change this to True, as it is used in `sampler`
+            loaders[phase] = DataLoader(dataset, batch_sizes['train'], shuffle=sampler is None,
+                                        sampler=sampler, num_workers=cfg.training.num_workers)
+        else:
+            loaders[phase] = DataLoader(dataset, batch_sizes['test'], shuffle=False,
+                                        sampler=sampler, num_workers=cfg.training.num_workers)
     return loaders
+
 
 class DistributedDataParallel(torch.nn.parallel.DistributedDataParallel):
     '''If the `model` object is wrapped in `torch.nn.parallel.DistributedDataParallel` we have
