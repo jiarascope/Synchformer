@@ -355,6 +355,13 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
             "test": test_vids_dir,
         }.get(split)
         self.vids_dir = str(_none_if_string_null(split_specific) or split_paths_dict.get(split) or vids_dir)
+        print(
+            f"[WDS] split={split} vids_dir={self.vids_dir} "
+            f"train_vids_dir={train_vids_dir} "
+            f"valid_vids_dir={valid_vids_dir} "
+            f"test_vids_dir={test_vids_dir}",
+            flush=True,
+        )
 
         self._decoded_cache: OrderedDict[Tuple[str, str], DecodedSample] = OrderedDict()
         self._tar_handles: OrderedDict[str, tarfile.TarFile] = OrderedDict()
@@ -456,7 +463,7 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
         return DecodedSample(sample_id=sample_id, rgb=rgb, audio=audio, meta=meta)
 
     def _get_decoded(self, index: int) -> DecodedSample:
-        if not self.cache_decoded:
+        if not self.cache_decoded or self.decoded_cache_size <= 0:
             return self._load_and_decode_uncached(index)
 
         shard_path, member_name = self.dataset[index]

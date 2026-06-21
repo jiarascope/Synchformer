@@ -3,26 +3,25 @@ set -euo pipefail
 
 
 
-'''
 
-run like:
+# run like:
 
-REPO=/home/jiaray/mrBean/Synchformer \
-TRAIN_TARS=/home/jiaray/mrBean/data/baseline_data/tarfiles \
-VALID_TARS=/home/jiaray/mrBean/data/valid_tarfiles \
-TEST_TARS=/home/jiaray/mrBean/data/valid_tarfiles \
-S1_CKPT=/path/to/stage1_feature_extractor/checkpoints/epoch_best.pt \
-LOGDIR=/home/jiaray/mrBean/logs/synchformer_stage2_wds \
-GPU=0 \
-BATCH_SIZE=16 \
-NUM_WORKERS=8 \
-PREFETCH_FACTOR=4 \
-DECODED_CACHE_SIZE=64 \
-bash /path/to/run_stage2_wds_finetune.sh
+# CUDA_VISIBLE_DEVICES=0 REPO=/home/jiaray/mrBean/Synchformer \
+# TRAIN_TARS=/home/jiaray/mrBean/data/webdataset_clips/train_set \
+# VALID_TARS=/home/jiaray/mrBean/data/webdataset_clips/valid_set \
+# TEST_TARS=/home/jiaray/mrBean/data/webdataset_clips/valid_set \
+# S1_CKPT=/home/jiaray/mrBean/Synchformer/checkpoints/segment_avclip/synchformer_avclip_audioset.pt \
+# LOGDIR=/home/jiaray/mrBean/logs/synchformer_stage2_wds \
+# GPU=0 \
+# BATCH_SIZE=8 \
+# NUM_WORKERS=8 \
+# PREFETCH_FACTOR=4 \
+# DECODED_CACHE_SIZE=0 \
+# EXTRA_OVERRIDES="training.max_epochs=1 data.dataset.size_ratio=0.01" \
+# bash /home/jiaray/mrBean/Synchformer/scripts/run_stage2_wds_finetune.sh
 
 
 
-'''
 # Run from anywhere. Override variables on the command line, e.g.:
 #   REPO=/home/jiaray/mrBean/Synchformer \
 #   TRAIN_TARS=/home/jiaray/mrBean/data/train_tars \
@@ -31,8 +30,8 @@ bash /path/to/run_stage2_wds_finetune.sh
 #   bash run_stage2_wds_finetune.sh
 
 REPO="${REPO:-/home/jiaray/mrBean/Synchformer}"
-TRAIN_TARS="${TRAIN_TARS:-/home/jiaray/mrBean/data/baseline_data/tarfiles}"
-VALID_TARS="${VALID_TARS:-$TRAIN_TARS}"
+TRAIN_TARS="${TRAIN_TARS:-/home/jiaray/mrBean/data/webdataset_clips/train_set}"
+VALID_TARS="${VALID_TARS:-/home/jiaray/mrBean/data/webdataset_clips/valid_set}"
 TEST_TARS="${TEST_TARS:-$VALID_TARS}"
 LOGDIR="${LOGDIR:-/home/jiaray/mrBean/logs/synchformer_stage2_wds}"
 
@@ -44,7 +43,8 @@ GPU="${GPU:-0}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
-DECODED_CACHE_SIZE="${DECODED_CACHE_SIZE:-64}"
+DECODED_CACHE_SIZE="${DECODED_CACHE_SIZE:-0}"
+CACHE_DECODED="${CACHE_DECODED:-false}"
 TAR_HANDLE_CACHE_SIZE="${TAR_HANDLE_CACHE_SIZE:-8}"
 RECURSIVE="${RECURSIVE:-false}"
 STRICT_VIDEO_FPS="${STRICT_VIDEO_FPS:-25}"
@@ -93,25 +93,25 @@ python main.py \
   logging.logdir="$LOGDIR" \
   data.vids_path="$TRAIN_TARS" \
   data.dataset.target=dataset.webdataset_tar_inmemory_cached_sync.WebDatasetTarInMemoryCachedSync \
-  +data.dataset.params.train_vids_dir="$TRAIN_TARS" \
-  +data.dataset.params.valid_vids_dir="$VALID_TARS" \
-  +data.dataset.params.test_vids_dir="$TEST_TARS" \
-  +data.dataset.params.recursive="$RECURSIVE" \
-  +data.dataset.params.cache_decoded=true \
-  +data.dataset.params.decoded_cache_size="$DECODED_CACHE_SIZE" \
-  +data.dataset.params.cache_tar_handles=true \
-  +data.dataset.params.tar_handle_cache_size="$TAR_HANDLE_CACHE_SIZE" \
-  +data.dataset.params.clone_cached_tensors=false \
-  +data.dataset.params.max_clip_len_sec=null \
-  +data.dataset.params.strict_video_fps="$STRICT_VIDEO_FPS" \
-  +data.dataset.params.strict_audio_fps="$STRICT_AUDIO_FPS" \
+  data.dataset.params.train_vids_dir="$TRAIN_TARS" \
+  data.dataset.params.valid_vids_dir="$VALID_TARS" \
+  data.dataset.params.test_vids_dir="$TEST_TARS" \
+  data.dataset.params.recursive="$RECURSIVE" \
+  data.dataset.params.cache_decoded="$CACHE_DECODED" \
+  data.dataset.params.decoded_cache_size="$DECODED_CACHE_SIZE" \
+  data.dataset.params.cache_tar_handles=true \
+  data.dataset.params.tar_handle_cache_size="$TAR_HANDLE_CACHE_SIZE" \
+  data.dataset.params.clone_cached_tensors=false \
+  data.dataset.params.max_clip_len_sec=null \
+  data.dataset.params.strict_video_fps="$STRICT_VIDEO_FPS" \
+  data.dataset.params.strict_audio_fps="$STRICT_AUDIO_FPS" \
   model.params.vfeat_extractor.params.ckpt_path="$S1_CKPT" \
   model.params.afeat_extractor.params.ckpt_path="$S1_CKPT" \
   training.base_batch_size="$BATCH_SIZE" \
   training.num_workers="$NUM_WORKERS" \
-  +training.persistent_workers=true \
-  +training.prefetch_factor="$PREFETCH_FACTOR" \
-  +training.pin_memory=true \
+  training.persistent_workers=true \
+  training.prefetch_factor="$PREFETCH_FACTOR" \
+  training.pin_memory=true \
   training.use_half_precision=true \
   training.skip_test=True \
   logging.vis_segment_sim=False \
