@@ -1,32 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-
-
-
-# run like:
-
-# CUDA_VISIBLE_DEVICES=0 REPO=/home/jiaray/mrBean/Synchformer \
-# TRAIN_TARS=/home/jiaray/mrBean/data/webdataset_clips/train_set \
-# VALID_TARS=/home/jiaray/mrBean/data/webdataset_clips/valid_set \
-# TEST_TARS=/home/jiaray/mrBean/data/webdataset_clips/valid_set \
-# S1_CKPT=/home/jiaray/mrBean/Synchformer/checkpoints/segment_avclip/synchformer_avclip_audioset.pt \
-# LOGDIR=/home/jiaray/mrBean/logs/synchformer_stage2_wds \
-# GPU=0 \
-# BATCH_SIZE=8 \
-# NUM_WORKERS=8 \
-# PREFETCH_FACTOR=4 \
-# DECODED_CACHE_SIZE=0 \
-# EXTRA_OVERRIDES="training.max_epochs=1 data.dataset.size_ratio=0.01" \
-# bash /home/jiaray/mrBean/Synchformer/scripts/run_stage2_wds_finetune.sh
-
-
-
 # Run from anywhere. Override variables on the command line, e.g.:
 #   REPO=/home/jiaray/mrBean/Synchformer \
 #   TRAIN_TARS=/home/jiaray/mrBean/data/train_tars \
 #   VALID_TARS=/home/jiaray/mrBean/data/valid_tars \
 #   S1_CKPT=/home/jiaray/mrBean/checkpoints/feature_extractors/epoch_best.pt \
+#   NUM_EPOCHS=5 \
+#   LOG_MAX_ITEMS=512 \
+#   LOG_FREQUENCY=100 \
 #   bash run_stage2_wds_finetune.sh
 
 REPO="${REPO:-/home/jiaray/mrBean/Synchformer}"
@@ -50,6 +32,10 @@ RECURSIVE="${RECURSIVE:-false}"
 STRICT_VIDEO_FPS="${STRICT_VIDEO_FPS:-25}"
 STRICT_AUDIO_FPS="${STRICT_AUDIO_FPS:-16000}"
 USE_WANDB="${USE_WANDB:-false}"
+
+NUM_EPOCHS="${NUM_EPOCHS:-5}"
+LOG_FREQUENCY="${LOG_FREQUENCY:-100}"
+LOG_MAX_ITEMS="${LOG_MAX_ITEMS:-512}"
 
 if [[ -z "$S1_CKPT" ]]; then
   echo "ERROR: Set S1_CKPT=/path/to/stage1_feature_extractor_epoch_best.pt" >&2
@@ -85,8 +71,18 @@ echo "VALID_TARS=$VALID_TARS"
 echo "TEST_TARS=$TEST_TARS"
 echo "LOGDIR=$LOGDIR"
 echo "S1_CKPT=$S1_CKPT"
-echo "BATCH_SIZE=$BATCH_SIZE NUM_WORKERS=$NUM_WORKERS PREFETCH_FACTOR=$PREFETCH_FACTOR"
+echo "GPU=$GPU"
+echo "BATCH_SIZE=$BATCH_SIZE"
+echo "NUM_WORKERS=$NUM_WORKERS"
+echo "PREFETCH_FACTOR=$PREFETCH_FACTOR"
+echo "NUM_EPOCHS=$NUM_EPOCHS"
+echo "LOG_FREQUENCY=$LOG_FREQUENCY"
+echo "LOG_MAX_ITEMS=$LOG_MAX_ITEMS"
+echo "CACHE_DECODED=$CACHE_DECODED"
 echo "DECODED_CACHE_SIZE=$DECODED_CACHE_SIZE per worker; cache is worker-local and persists across epochs only with persistent_workers=true"
+echo "TAR_HANDLE_CACHE_SIZE=$TAR_HANDLE_CACHE_SIZE"
+
+set -x
 
 python main.py \
   config=./configs/sync.yaml \
@@ -109,11 +105,16 @@ python main.py \
   model.params.afeat_extractor.params.ckpt_path="$S1_CKPT" \
   training.base_batch_size="$BATCH_SIZE" \
   training.num_workers="$NUM_WORKERS" \
+  training.num_epochs="$NUM_EPOCHS" \
   training.persistent_workers=true \
   training.prefetch_factor="$PREFETCH_FACTOR" \
   training.pin_memory=true \
   training.use_half_precision=true \
   training.skip_test=True \
+  logging.log_frequency="$LOG_FREQUENCY" \
+  logging.log_max_items="$LOG_MAX_ITEMS" \
   logging.vis_segment_sim=False \
   logging.log_code_state=False \
   logging.use_wandb="$USE_WANDB"
+
+set +x
