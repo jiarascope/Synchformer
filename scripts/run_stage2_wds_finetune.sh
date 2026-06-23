@@ -20,13 +20,13 @@ LOGDIR="${LOGDIR:-/home/jiaray/mrBean/logs/synchformer_stage2_wds}"
 # Stage-1 AV feature-extractor checkpoint. Required for official stage-2 training.
 # This is the checkpoint containing both audio and visual feature extractor weights.
 S1_CKPT="${S1_CKPT:-}"
-
 GPU="${GPU:-0}"
-BATCH_SIZE="${BATCH_SIZE:-16}"
-NUM_WORKERS="${NUM_WORKERS:-8}"
-PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
+NUM_WORKERS="${NUM_WORKERS:-1}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 DECODED_CACHE_SIZE="${DECODED_CACHE_SIZE:-0}"
 CACHE_DECODED="${CACHE_DECODED:-false}"
+CACHE_TAR_HANDLES="${CACHE_TAR_HANDLES:-false}"
 TAR_HANDLE_CACHE_SIZE="${TAR_HANDLE_CACHE_SIZE:-8}"
 RECURSIVE="${RECURSIVE:-false}"
 STRICT_VIDEO_FPS="${STRICT_VIDEO_FPS:-25}"
@@ -95,7 +95,7 @@ python main.py \
   data.dataset.params.recursive="$RECURSIVE" \
   data.dataset.params.cache_decoded="$CACHE_DECODED" \
   data.dataset.params.decoded_cache_size="$DECODED_CACHE_SIZE" \
-  data.dataset.params.cache_tar_handles=true \
+  data.dataset.params.cache_tar_handles="$CACHE_TAR_HANDLES" \
   data.dataset.params.tar_handle_cache_size="$TAR_HANDLE_CACHE_SIZE" \
   data.dataset.params.clone_cached_tensors=false \
   data.dataset.params.max_clip_len_sec=null \
@@ -108,7 +108,10 @@ python main.py \
   training.num_epochs="$NUM_EPOCHS" \
   training.persistent_workers=true \
   training.prefetch_factor="$PREFETCH_FACTOR" \
-  training.pin_memory=true \
+  training.pin_memory=false \
+  data.dataset.params.debug_io=true \
+  data.dataset.params.worker_threads=1 \
+  data.dataset.params.decode_threads=1 \
   training.use_half_precision=true \
   training.skip_test=True \
   logging.log_frequency="$LOG_FREQUENCY" \

@@ -15,8 +15,10 @@ Design for stage-2 Synchformer training:
       performs random crop/offset during training
 
 Important for multi-epoch training:
-    - Set DataLoader persistent_workers=True, otherwise worker-local decoded caches
-      are destroyed after each epoch.
+    - Worker-local decoded caches only persist across epochs when DataLoader
+      persistent_workers=True. This class now makes tar-handle state process-local
+      so persistent workers are safer, but cache_tar_handles still defaults to False
+      because live tarfile handles are a common source of DataLoader hangs.
     - Do not set max_clip_len_sec=5 for stage-2 training. Keep it None/null so the
       built-in transform can sample a 5s crop plus audio/video offset from the full
       10s clip.
@@ -32,11 +34,26 @@ import glob
 import io
 import os
 import re
+import signal
+import sys
 import tarfile
+import faulthandler
+import threading
+import time
+from contextlib import closing
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+# Keep worker/decoder helper libraries from silently creating huge thread pools.
+# These must be set before torch/OpenCV/FFmpeg-heavy code is imported in many setups.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("OPENCV_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 
 import torch
 
@@ -52,6 +69,83 @@ from dataset.dataset_utils import subsample_dataset
 
 _TAR_SUFFIXES = (".tar", ".tar.gz", ".tgz")
 _VIDEO_SUFFIXES = (".mp4", ".m4v", ".mov")
+
+
+_FAULTHANDLER_INSTALLED_PID = None
+_FAULTHANDLER_FILES: Dict[int, Any] = {}
+_THREAD_LIMIT_CONFIGURED_PID = None
+
+
+def _install_debug_signal_handler() -> None:
+    """
+    Install an in-process stack dump handler.
+
+    Usage while the job is running:
+        kill -USR1 <pid>
+
+    Output:
+        /tmp/synchformer_stack_<pid>.log
+
+    This does not require py-spy, ptrace permissions, or sudo because each
+    Python process dumps its own stack.
+    """
+    global _FAULTHANDLER_INSTALLED_PID
+
+    pid = os.getpid()
+    if _FAULTHANDLER_INSTALLED_PID == pid:
+        return
+
+    path = f"/tmp/synchformer_stack_{pid}.log"
+    f = open(path, "a", buffering=1)
+    _FAULTHANDLER_FILES[pid] = f  # keep file alive
+
+    try:
+        faulthandler.enable(file=f, all_threads=True)
+        faulthandler.register(signal.SIGUSR1, file=f, all_threads=True)
+        print(f"[WDS][pid={pid}] faulthandler installed: kill -USR1 {pid}; log={path}", flush=True)
+    except Exception as exc:
+        print(f"[WDS][pid={pid}] failed to install faulthandler: {exc!r}", flush=True)
+
+    _FAULTHANDLER_INSTALLED_PID = pid
+
+
+def _configure_process_thread_limits(num_threads: int = 1) -> None:
+    """
+    Clamp Python/torch/BLAS/OpenMP-ish thread pools inside each process.
+
+    Shell environment variables are not always enough once libraries have been
+    imported/initialized, especially inside DataLoader workers. Calling this
+    from worker code makes the setting process-local and repeatable after fork.
+    """
+    global _THREAD_LIMIT_CONFIGURED_PID
+
+    pid = os.getpid()
+    if _THREAD_LIMIT_CONFIGURED_PID == pid:
+        return
+
+    n_int = max(1, int(num_threads))
+    n = str(n_int)
+    os.environ["OMP_NUM_THREADS"] = n
+    os.environ["MKL_NUM_THREADS"] = n
+    os.environ["OPENBLAS_NUM_THREADS"] = n
+    os.environ["NUMEXPR_NUM_THREADS"] = n
+    os.environ["OPENCV_NUM_THREADS"] = n
+    os.environ["VECLIB_MAXIMUM_THREADS"] = n
+
+    try:
+        torch.set_num_threads(n_int)
+    except Exception as exc:
+        print(f"[WDS][pid={pid}] torch.set_num_threads failed: {exc!r}", flush=True)
+
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        # PyTorch may reject this after interop work has started. That's okay;
+        # torch.set_num_threads is the more important one for this dataset path.
+        pass
+
+    print(f"[WDS][pid={pid}] thread limits configured: {n_int}", flush=True)
+    _THREAD_LIMIT_CONFIGURED_PID = pid
 
 
 def _as_bool(x: Any) -> bool:
@@ -164,6 +258,9 @@ def decode_mp4_bytes_with_av(
     force_audio_rate: Optional[int] = 16000,
     force_audio_mono: bool = True,
     max_clip_len_sec: Optional[float] = None,
+    decode_threads: int = 1,
+    sample_id: Optional[str] = None,
+    debug_io: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
     """
     Decode MP4 bytes from memory into Synchformer-style tensors.
@@ -173,23 +270,31 @@ def decode_mp4_bytes_with_av(
         audio: float32 tensor, shape (Ta,), roughly [-1, 1]
         meta:  dict with video fps and audio framerate entries
     """
+    _configure_process_thread_limits(1)
+
+    pid = os.getpid()
+    label = sample_id or "<unknown-sample>"
+
     max_clip_len_sec = _none_if_string_null(max_clip_len_sec)
     if max_clip_len_sec is not None:
         max_clip_len_sec = float(max_clip_len_sec)
 
     # ---- video ----
-    video_container = av.open(io.BytesIO(mp4_bytes))
-    try:
+    if debug_io:
+        print(f"[WDS][pid={pid}] video_decode_start sample={label}", flush=True)
+
+    with closing(av.open(io.BytesIO(mp4_bytes))) as video_container:
         video_streams = [s for s in video_container.streams if s.type == "video"]
         if not video_streams:
             raise RuntimeError("No video stream found in MP4 sample")
 
         video_stream = video_streams[0]
-        # AUTO can use multiple codec threads where supported.
-        try:
-            video_stream.thread_type = "AUTO"
-        except Exception:
-            pass
+        if decode_threads is not None and int(decode_threads) > 0:
+            # Avoid FFmpeg/PyAV spawning enormous decoder thread pools in each
+            # DataLoader worker. Let this fail loudly if the runtime does not
+            # support the attribute, because silent fallback is hard to debug.
+            video_stream.codec_context.thread_count = int(decode_threads)
+            video_stream.codec_context.thread_type = "SLICE"
 
         video_fps = _rate_to_float(video_stream.average_rate or video_stream.base_rate, 25.0)
         max_video_frames = None
@@ -202,21 +307,27 @@ def decode_mp4_bytes_with_av(
                 break
             arr = frame.to_rgb().to_ndarray()  # H, W, 3, uint8
             video_frames.append(torch.from_numpy(arr).permute(2, 0, 1).contiguous())
-    finally:
-        video_container.close()
 
     if not video_frames:
         raise RuntimeError("No video frames decoded from MP4 sample")
     rgb = torch.stack(video_frames, dim=0)
 
+    if debug_io:
+        print(f"[WDS][pid={pid}] video_decode_done frames={rgb.shape[0]} shape={tuple(rgb.shape)} sample={label}", flush=True)
+
     # ---- audio ----
-    audio_container = av.open(io.BytesIO(mp4_bytes))
-    try:
+    if debug_io:
+        print(f"[WDS][pid={pid}] audio_decode_start sample={label}", flush=True)
+
+    with closing(av.open(io.BytesIO(mp4_bytes))) as audio_container:
         audio_streams = [s for s in audio_container.streams if s.type == "audio"]
         if not audio_streams:
             raise RuntimeError("No audio stream found in MP4 sample")
 
         audio_stream = audio_streams[0]
+        if decode_threads is not None and int(decode_threads) > 0:
+            audio_stream.codec_context.thread_count = int(decode_threads)
+
         src_audio_rate = int(audio_stream.rate or force_audio_rate or 16000)
         out_audio_rate = int(force_audio_rate or src_audio_rate)
 
@@ -263,8 +374,6 @@ def decode_mp4_bytes_with_av(
                 append_audio_frame(out_frame)
                 if max_audio_samples is not None and total_audio_samples >= max_audio_samples:
                     break
-    finally:
-        audio_container.close()
 
     if not audio_chunks:
         raise RuntimeError("No audio decoded from MP4 sample")
@@ -272,6 +381,9 @@ def decode_mp4_bytes_with_av(
     audio = torch.cat(audio_chunks, dim=0).float().contiguous()
     if max_audio_samples is not None:
         audio = audio[:max_audio_samples]
+
+    if debug_io:
+        print(f"[WDS][pid={pid}] audio_decode_done samples={audio.shape[0]} shape={tuple(audio.shape)} sample={label}", flush=True)
 
     meta = {
         "video": {"fps": [video_fps], "duration": [float(rgb.shape[0]) / float(video_fps)]},
@@ -322,11 +434,15 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
         max_clip_len_sec: Optional[float] = None,
         strict_video_fps: Optional[float] = None,
         strict_audio_fps: Optional[float] = None,
-        cache_decoded: bool = True,
-        decoded_cache_size: int = 64,
-        cache_tar_handles: bool = True,
+        cache_decoded: bool = False,
+        decoded_cache_size: int = 0,
+        cache_tar_handles: bool = False,
         tar_handle_cache_size: int = 8,
         clone_cached_tensors: bool = False,
+        decode_threads: int = 1,
+        worker_threads: int = 1,
+        debug_io: bool = True,
+        debug_signal: bool = True,
         **unused_kwargs: Any,
     ) -> None:
         super().__init__()
@@ -346,6 +462,12 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
         self.cache_tar_handles = _as_bool(cache_tar_handles)
         self.tar_handle_cache_size = int(tar_handle_cache_size)
         self.clone_cached_tensors = _as_bool(clone_cached_tensors)
+        self.decode_threads = int(decode_threads)
+        self.worker_threads = int(worker_threads)
+        self.debug_io = _as_bool(debug_io)
+        self.debug_signal = _as_bool(debug_signal)
+        self._owner_pid = os.getpid()
+        self._tar_lock = threading.RLock()
 
         split_paths_dict = _mapping_to_plain_dict(split_paths)
         split_specific = {
@@ -384,15 +506,20 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
         state = self.__dict__.copy()
         state["_decoded_cache"] = OrderedDict()
         state["_tar_handles"] = OrderedDict()
+        state["_owner_pid"] = None
+        state["_tar_lock"] = None
         return state
 
     def close(self) -> None:
-        for tar in self._tar_handles.values():
+        tar_handles = getattr(self, "_tar_handles", None)
+        if not tar_handles:
+            return
+        for tar in list(tar_handles.values()):
             try:
                 tar.close()
             except Exception:
                 pass
-        self._tar_handles.clear()
+        tar_handles.clear()
 
     def __del__(self):
         try:
@@ -412,58 +539,135 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.dataset)
 
+    def _ensure_process_local_state(self) -> None:
+        """
+        DataLoader/fork safety: never use tar handles, locks, or decoded tensors
+        that were created in another process. This matters with forked workers and
+        especially with persistent_workers=True.
+        """
+        if getattr(self, "debug_signal", True):
+            _install_debug_signal_handler()
+        _configure_process_thread_limits(getattr(self, "worker_threads", 1))
+
+        pid = os.getpid()
+        if getattr(self, "_owner_pid", None) == pid and getattr(self, "_tar_lock", None) is not None:
+            return
+
+        self._owner_pid = pid
+        self._decoded_cache = OrderedDict()
+        self._tar_handles = OrderedDict()
+        self._tar_lock = threading.RLock()
+
+        if getattr(self, "debug_io", False):
+            print(f"[WDS][pid={pid}] process-local state reset", flush=True)
+
     def _get_tar(self, shard_path: str) -> tarfile.TarFile:
+        self._ensure_process_local_state()
+
         if not self.cache_tar_handles:
             return tarfile.open(shard_path, "r:*")
 
-        cached = self._tar_handles.get(shard_path)
-        if cached is not None:
-            self._tar_handles.move_to_end(shard_path)
-            return cached
+        with self._tar_lock:
+            cached = self._tar_handles.get(shard_path)
+            if cached is not None:
+                self._tar_handles.move_to_end(shard_path)
+                return cached
 
-        tar = tarfile.open(shard_path, "r:*")
-        self._tar_handles[shard_path] = tar
+            tar = tarfile.open(shard_path, "r:*")
+            self._tar_handles[shard_path] = tar
 
-        if self.tar_handle_cache_size > 0:
-            while len(self._tar_handles) > self.tar_handle_cache_size:
-                _, old_tar = self._tar_handles.popitem(last=False)
-                old_tar.close()
-        return tar
+            if self.tar_handle_cache_size > 0:
+                while len(self._tar_handles) > self.tar_handle_cache_size:
+                    _, old_tar = self._tar_handles.popitem(last=False)
+                    old_tar.close()
+            return tar
 
     def _read_mp4_bytes(self, shard_path: str, member_name: str, sample_id: str) -> bytes:
-        if self.cache_tar_handles:
-            tar = self._get_tar(shard_path)
-            member = tar.getmember(member_name)
-            src = tar.extractfile(member)
-            if src is None:
-                raise RuntimeError(f"Could not read {sample_id}")
-            return src.read()
+        self._ensure_process_local_state()
 
-        with self._get_tar(shard_path) as tar:
+        pid = os.getpid()
+        t0 = time.time()
+
+        if self.debug_io:
+            print(f"[WDS][pid={pid}] read_start sample={sample_id}", flush=True)
+
+        def read_member(tar: tarfile.TarFile) -> bytes:
             member = tar.getmember(member_name)
+            if not member.isfile():
+                raise RuntimeError(f"Tar member is not a file: {sample_id}")
+
             src = tar.extractfile(member)
             if src is None:
-                raise RuntimeError(f"Could not read {sample_id}")
-            return src.read()
+                raise RuntimeError(f"Could not extract {sample_id}")
+
+            with closing(src):
+                data = src.read()
+
+            expected = int(member.size)
+            got = len(data)
+            if got != expected:
+                raise RuntimeError(f"Short read for {sample_id}: got {got} bytes, expected {expected}")
+
+            return data
+
+        if self.cache_tar_handles:
+            # Protect each cached TarFile object. Normal DataLoader map-style usage
+            # is single-threaded per worker process, but PyAV/torch libraries can
+            # create helper threads, and this lock makes accidental reuse safer.
+            with self._tar_lock:
+                data = read_member(self._get_tar(shard_path))
+        else:
+            with tarfile.open(shard_path, "r:*") as tar:
+                data = read_member(tar)
+
+        if self.debug_io:
+            dt = time.time() - t0
+            print(f"[WDS][pid={pid}] read_done seconds={dt:.3f} bytes={len(data)} sample={sample_id}", flush=True)
+
+        return data
 
     def _load_and_decode_uncached(self, index: int) -> DecodedSample:
+        self._ensure_process_local_state()
+
         shard_path, member_name = self.dataset[index]
         sample_id = f"{shard_path}::{member_name}"
+        pid = os.getpid()
+
+        if self.debug_io:
+            print(f"[WDS][pid={pid}] load_start index={index} sample={sample_id}", flush=True)
+
         mp4_bytes = self._read_mp4_bytes(shard_path, member_name, sample_id)
+
+        if self.debug_io:
+            print(f"[WDS][pid={pid}] decode_start index={index} bytes={len(mp4_bytes)} sample={sample_id}", flush=True)
 
         rgb, audio, meta = decode_mp4_bytes_with_av(
             mp4_bytes,
             force_audio_rate=self.audio_rate,
             force_audio_mono=self.audio_mono,
             max_clip_len_sec=self.max_clip_len_sec,
+            decode_threads=self.decode_threads,
+            sample_id=sample_id,
+            debug_io=self.debug_io,
         )
+
+        if self.debug_io:
+            print(
+                f"[WDS][pid={pid}] decode_done index={index} "
+                f"rgb_shape={tuple(rgb.shape)} audio_shape={tuple(audio.shape)} sample={sample_id}",
+                flush=True,
+            )
 
         _check_close(float(meta["video"]["fps"][0]), self.strict_video_fps, "video fps", sample_id)
         _check_close(float(meta["audio"]["framerate"][0]), self.strict_audio_fps, "audio fps", sample_id)
+
+        if self.debug_io:
+            print(f"[WDS][pid={pid}] load_done index={index} sample={sample_id}", flush=True)
+
         return DecodedSample(sample_id=sample_id, rgb=rgb, audio=audio, meta=meta)
 
     def _get_decoded(self, index: int) -> DecodedSample:
-        if not self.cache_decoded or self.decoded_cache_size <= 0:
+        if not self.cache_decoded:
             return self._load_and_decode_uncached(index)
 
         shard_path, member_name = self.dataset[index]
@@ -483,6 +687,12 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
         return value
 
     def __getitem__(self, index: int):
+        self._ensure_process_local_state()
+        pid = os.getpid()
+
+        if self.debug_io:
+            print(f"[WDS][pid={pid}] getitem_start index={index}", flush=True)
+
         decoded = self._get_decoded(index)
 
         # Usually safe to leave False because Synchformer transforms assign new tensors/slices.
@@ -499,6 +709,32 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
             "split": self.split,
         }
 
+        if self.debug_io:
+            print(f"[WDS][pid={pid}] transform_start index={index} sample={decoded.sample_id}", flush=True)
+
         if self.transforms is not None:
             item = self.transforms(item)
+        
+        def _tensor_mb(x):
+            return x.numel() * x.element_size() / 1024 / 1024 if torch.is_tensor(x) else 0
+
+        total_mb = sum(_tensor_mb(v) for v in item.values())
+        if total_mb > 512:
+            raise RuntimeError(
+                f"Transformed sample too large: {total_mb:.1f} MB "
+                f"index={index} sample={decoded.sample_id} "
+                f"video_shape={tuple(item['video'].shape)} "
+                f"audio_shape={tuple(item['audio'].shape)}"
+            )
+
+        if self.debug_io:
+            video_shape = tuple(item["video"].shape) if "video" in item and hasattr(item["video"], "shape") else None
+            audio_shape = tuple(item["audio"].shape) if "audio" in item and hasattr(item["audio"], "shape") else None
+            print(
+                f"[WDS][pid={pid}] transform_done index={index} "
+                f"video_shape={video_shape} audio_shape={audio_shape} sample={decoded.sample_id}",
+                flush=True,
+            )
+            print(f"[WDS][pid={pid}] getitem_done index={index}", flush=True)
+
         return item
