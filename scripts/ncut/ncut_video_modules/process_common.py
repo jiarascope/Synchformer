@@ -198,6 +198,21 @@ def run_ncut_embedding(
     return eig.detach().cpu()
 
 
+def _rgb_float_to_uint8(rgb: np.ndarray) -> np.ndarray:
+    """Normalize or scale color coordinates into uint8 RGB."""
+    rgb = np.asarray(rgb, dtype=np.float32)
+    if rgb.max() <= 1.0 and rgb.min() >= 0.0:
+        rgb = rgb * 255.0
+    elif rgb.max() <= 255.0 and rgb.min() >= 0.0:
+        rgb = rgb
+    else:
+        rgb = rgb - rgb.min(axis=0, keepdims=True)
+        denom = rgb.max(axis=0, keepdims=True)
+        rgb = np.divide(rgb, denom + 1e-6) * 255.0
+
+    return rgb.clip(0, 255).astype(np.uint8)
+
+
 def embedding_to_umap_rgb(eig: torch.Tensor, eig_rgb_dims: int) -> np.ndarray:
     """Map NCut eigenvectors to RGB using ncut_pytorch's UMAP coloring."""
     from ncut_pytorch.color import umap_color
@@ -209,10 +224,39 @@ def embedding_to_umap_rgb(eig: torch.Tensor, eig_rgb_dims: int) -> np.ndarray:
         rgb = rgb.detach().cpu().numpy()
 
     # ncut_pytorch color helpers may return either 0..1 floats or 0..255 values.
-    if rgb.max() <= 1.0:
-        rgb = rgb * 255.0
+    return _rgb_float_to_uint8(rgb)
 
-    return rgb.clip(0, 255).astype(np.uint8)
+
+def embedding_to_tsne_rgb(eig: torch.Tensor, eig_rgb_dims: int, seed: int) -> np.ndarray:
+    """Map NCut eigenvectors to RGB using 3D t-SNE coordinates."""
+    from sklearn.manifold import TSNE
+
+    eig_dims = min(eig_rgb_dims, eig.shape[1])
+    X = eig[:, :eig_dims].detach().cpu().float().numpy()
+
+    if X.shape[0] < 2:
+        return np.zeros((X.shape[0], 3), dtype=np.uint8)
+
+    perplexity = min(30.0, max(1.0, (X.shape[0] - 1) / 3.0))
+    rgb = TSNE(
+        n_components=3,
+        perplexity=perplexity,
+        init="pca",
+        learning_rate="auto",
+        random_state=seed,
+    ).fit_transform(X)
+
+    return _rgb_float_to_uint8(rgb)
+
+
+def embedding_to_rgb(eig: torch.Tensor, *, args: argparse.Namespace) -> np.ndarray:
+    """Map NCut eigenvectors to RGB using the requested reducer."""
+    mapping = getattr(args, "embedding_map", "umap")
+    if mapping == "umap":
+        return embedding_to_umap_rgb(eig, args.eig_rgb_dims)
+    if mapping == "tsne":
+        return embedding_to_tsne_rgb(eig, args.eig_rgb_dims, args.seed)
+    raise ValueError(f"Unsupported embedding_map: {mapping}")
 
 
 def cluster_embedding(
@@ -240,7 +284,7 @@ def run_embedding_pipeline(
     rgb: bool = False,
 ) -> Tuple[torch.Tensor, np.ndarray, Optional[np.ndarray]]:
     """
-    Run the common NCut+k-means pipeline, optionally also returning UMAP RGB.
+    Run the common NCut+k-means pipeline, optionally also returning mapped RGB.
 
     Returns:
         eig: CPU tensor [N,K]
@@ -255,7 +299,7 @@ def run_embedding_pipeline(
         num_clusters=args.num_clusters,
         seed=args.seed,
     )
-    rgb_flat = embedding_to_umap_rgb(eig, args.eig_rgb_dims) if rgb else None
+    rgb_flat = embedding_to_rgb(eig, args=args) if rgb else None
     return eig, labels, rgb_flat
 
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from .process_common import (
@@ -12,10 +11,8 @@ from .process_common import (
     extract_window_segments,
     group_records_by_key,
     make_window_starts,
-    records_without_images,
     run_embedding_pipeline,
     write_held_mask_overlay_videos,
-    write_json,
 )
 from .video_io import get_video_info, iter_videos
 
@@ -31,7 +28,7 @@ def process_video_directory_joint_ncut(
     Extract MotionFormer tokens from all videos in video_dir, concatenate them,
     run ONE NCut over all tokens, then write per-video shared-color overlays.
     """
-    out_dir = out_root / "joint_video_dir_ncut"
+    out_dir = out_root
     out_dir.mkdir(parents=True, exist_ok=True)
 
     video_paths = list(iter_videos(None, str(video_dir)))
@@ -81,7 +78,6 @@ def process_video_directory_joint_ncut(
 
     X_all = torch.cat(all_tokens, dim=0)
     print(f"[joint] total token matrix: {tuple(X_all.shape)}")
-    torch.save(X_all, out_dir / "joint_tokens_flat.pt")
 
     # ------------------------------------------------------------------
     # 2. Run ONE NCut over all tokens from all videos.
@@ -95,14 +91,13 @@ def process_video_directory_joint_ncut(
     )
     assert rgb_all is not None
 
-    torch.save(eig_all, out_dir / "joint_ncut_eig_flat.pt")
-
     eig_dims = min(args.eig_rgb_dims, eig_all.shape[1])
-    print(f"[joint] computed UMAP RGB from first {eig_dims} eigenvectors")
-    np.save(out_dir / "joint_umap_rgb_flat.npy", rgb_all)
+    print(
+        f"[joint] computed {args.embedding_map.upper()} RGB from first "
+        f"{eig_dims} eigenvectors"
+    )
 
     print("[joint] ran shared k-means on joint NCut embedding")
-    np.save(out_dir / "joint_cluster_labels_flat.npy", labels_all)
 
     # ------------------------------------------------------------------
     # 3. Write one output video per input video.
@@ -112,8 +107,6 @@ def process_video_directory_joint_ncut(
     for video_path_str, video_records in by_video.items():
         video_path = Path(video_path_str)
         stem = video_path.stem
-        video_out_dir = out_dir / stem
-        video_out_dir.mkdir(parents=True, exist_ok=True)
 
         info = video_records[0]["video_info"]
         video_fps = info["fps"]
@@ -133,8 +126,8 @@ def process_video_directory_joint_ncut(
 
         write_held_mask_overlay_videos(
             video_path=video_path,
-            rgb_out_path=video_out_dir / "joint_umap_rgb_overlay.mp4",
-            cluster_out_path=video_out_dir / "joint_clusters_overlay.mp4",
+            rgb_out_path=out_dir / f"{stem}_joint_{args.embedding_map}_rgb_overlay.mp4",
+            cluster_out_path=out_dir / f"{stem}_joint_clusters_overlay.mp4",
             rgb_mask_accum=rgb_mask_accum,
             cluster_prob_accum=cluster_prob_accum,
             mask_count=mask_count,
@@ -144,31 +137,6 @@ def process_video_directory_joint_ncut(
             alpha=args.alpha,
         )
 
-        write_json(
-            video_out_dir / "joint_video_segments.json",
-            {
-                "video": str(video_path),
-                "video_info": info,
-                "segment_sec": args.segment_sec,
-                "stride_sec": args.stride_sec,
-                "num_windows": len(video_records),
-                "segments": records_without_images(video_records),
-            },
-        )
-
-        print(f"[joint] wrote {video_out_dir}")
-
-    write_json(
-        out_dir / "joint_all_segments.json",
-        {
-            "video_dir": str(video_dir),
-            "num_videos": len(video_paths),
-            "num_segments": len(records),
-            "num_tokens": int(eig_all.shape[0]),
-            "num_eig": int(args.num_eig),
-            "eig_rgb_dims": int(args.eig_rgb_dims),
-            "segments": records_without_images(records),
-        },
-    )
+        print(f"[joint] wrote mp4 overlays for {stem} to {out_dir}")
 
     print(f"[joint] all outputs written to: {out_dir}")
