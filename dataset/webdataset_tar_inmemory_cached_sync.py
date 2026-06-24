@@ -261,6 +261,7 @@ def decode_mp4_bytes_with_av(
     decode_threads: int = 1,
     sample_id: Optional[str] = None,
     debug_io: bool = False,
+    profile_io: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
     """
     Decode MP4 bytes from memory into Synchformer-style tensors.
@@ -274,6 +275,7 @@ def decode_mp4_bytes_with_av(
 
     pid = os.getpid()
     label = sample_id or "<unknown-sample>"
+    t_decode_start = time.perf_counter()
 
     max_clip_len_sec = _none_if_string_null(max_clip_len_sec)
     if max_clip_len_sec is not None:
@@ -305,7 +307,7 @@ def decode_mp4_bytes_with_av(
         for frame_idx, frame in enumerate(video_container.decode(video_stream)):
             if max_video_frames is not None and frame_idx >= max_video_frames:
                 break
-            arr = frame.to_rgb().to_ndarray()  # H, W, 3, uint8
+            arr = frame.to_ndarray(format="rgb24").copy()  # H, W, 3, uint8; owns memory
             video_frames.append(torch.from_numpy(arr).permute(2, 0, 1).contiguous())
 
     if not video_frames:
@@ -314,6 +316,8 @@ def decode_mp4_bytes_with_av(
 
     if debug_io:
         print(f"[WDS][pid={pid}] video_decode_done frames={rgb.shape[0]} shape={tuple(rgb.shape)} sample={label}", flush=True)
+
+    t_video_done = time.perf_counter()
 
     # ---- audio ----
     if debug_io:
@@ -348,7 +352,7 @@ def decode_mp4_bytes_with_av(
 
         def append_audio_frame(out_frame: Any) -> None:
             nonlocal total_audio_samples
-            arr = out_frame.to_ndarray()  # usually channels, samples
+            arr = out_frame.to_ndarray().copy()  # force NumPy-owned memory
             tensor = torch.from_numpy(arr).float()
             if tensor.numel() > 0 and tensor.abs().max() > 2.0:
                 tensor = tensor / 32768.0
@@ -384,6 +388,19 @@ def decode_mp4_bytes_with_av(
 
     if debug_io:
         print(f"[WDS][pid={pid}] audio_decode_done samples={audio.shape[0]} shape={tuple(audio.shape)} sample={label}", flush=True)
+
+    t_audio_done = time.perf_counter()
+    if profile_io:
+        print(
+            f"[WDS_PROFILE_DECODE][pid={pid}] "
+            f"video_decode={t_video_done - t_decode_start:.4f}s "
+            f"audio_decode={t_audio_done - t_video_done:.4f}s "
+            f"decode_total={t_audio_done - t_decode_start:.4f}s "
+            f"video_frames={rgb.shape[0]} "
+            f"audio_samples={audio.shape[0]} "
+            f"sample={label}",
+            flush=True,
+        )
 
     meta = {
         "video": {"fps": [video_fps], "duration": [float(rgb.shape[0]) / float(video_fps)]},
@@ -443,6 +460,8 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
         worker_threads: int = 1,
         debug_io: bool = True,
         debug_signal: bool = True,
+        profile_io: bool = False,
+        profile_every: int = 100,
         **unused_kwargs: Any,
     ) -> None:
         super().__init__()
@@ -466,6 +485,8 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
         self.worker_threads = int(worker_threads)
         self.debug_io = _as_bool(debug_io)
         self.debug_signal = _as_bool(debug_signal)
+        self.profile_io = _as_bool(profile_io)
+        self.profile_every = max(1, int(profile_every))
         self._owner_pid = os.getpid()
         self._tar_lock = threading.RLock()
 
@@ -636,7 +657,11 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
         if self.debug_io:
             print(f"[WDS][pid={pid}] load_start index={index} sample={sample_id}", flush=True)
 
+        do_profile = self.profile_io and (index % self.profile_every == 0)
+
+        t0 = time.perf_counter()
         mp4_bytes = self._read_mp4_bytes(shard_path, member_name, sample_id)
+        t_read_done = time.perf_counter()
 
         if self.debug_io:
             print(f"[WDS][pid={pid}] decode_start index={index} bytes={len(mp4_bytes)} sample={sample_id}", flush=True)
@@ -649,7 +674,23 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
             decode_threads=self.decode_threads,
             sample_id=sample_id,
             debug_io=self.debug_io,
+            profile_io=do_profile,
         )
+        t_decode_done = time.perf_counter()
+
+        if do_profile:
+            print(
+                f"[WDS_PROFILE_LOAD][pid={pid}] "
+                f"index={index} "
+                f"read={t_read_done - t0:.4f}s "
+                f"decode_total={t_decode_done - t_read_done:.4f}s "
+                f"load_total={t_decode_done - t0:.4f}s "
+                f"bytes={len(mp4_bytes)} "
+                f"rgb_shape={tuple(rgb.shape)} "
+                f"audio_shape={tuple(audio.shape)} "
+                f"sample={sample_id}",
+                flush=True,
+            )
 
         if self.debug_io:
             print(
@@ -693,12 +734,17 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
         if self.debug_io:
             print(f"[WDS][pid={pid}] getitem_start index={index}", flush=True)
 
+        do_profile = self.profile_io and (index % self.profile_every == 0)
+
+        t0 = time.perf_counter()
         decoded = self._get_decoded(index)
+        t_load_done = time.perf_counter()
 
         # Usually safe to leave False because Synchformer transforms assign new tensors/slices.
         # Set True only if you add in-place transforms that mutate raw decoded RGB/audio.
         rgb = decoded.rgb.clone() if self.clone_cached_tensors else decoded.rgb
         audio = decoded.audio.clone() if self.clone_cached_tensors else decoded.audio
+        t_clone_done = time.perf_counter()
 
         item = {
             "video": rgb,
@@ -714,7 +760,8 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
 
         if self.transforms is not None:
             item = self.transforms(item)
-        
+        t_transform_done = time.perf_counter()
+
         def _tensor_mb(x):
             return x.numel() * x.element_size() / 1024 / 1024 if torch.is_tensor(x) else 0
 
@@ -725,6 +772,23 @@ class WebDatasetTarInMemoryCachedSync(torch.utils.data.Dataset):
                 f"index={index} sample={decoded.sample_id} "
                 f"video_shape={tuple(item['video'].shape)} "
                 f"audio_shape={tuple(item['audio'].shape)}"
+            )
+
+        if do_profile:
+            video_shape = tuple(item["video"].shape) if "video" in item and hasattr(item["video"], "shape") else None
+            audio_shape = tuple(item["audio"].shape) if "audio" in item and hasattr(item["audio"], "shape") else None
+            print(
+                f"[WDS_PROFILE_GETITEM][pid={pid}] "
+                f"index={index} "
+                f"load_decode={t_load_done - t0:.4f}s "
+                f"clone={t_clone_done - t_load_done:.4f}s "
+                f"transform={t_transform_done - t_clone_done:.4f}s "
+                f"getitem_total={t_transform_done - t0:.4f}s "
+                f"transformed_mb={total_mb:.1f} "
+                f"video_shape={video_shape} "
+                f"audio_shape={audio_shape} "
+                f"sample={decoded.sample_id}",
+                flush=True,
             )
 
         if self.debug_io:

@@ -281,7 +281,7 @@ def train(cfg):
         dist.barrier()
 
     # don't do testing if a user wants to only train the model
-    if cfg.get('skip_test', False):
+    if cfg.get('skip_test', False) or cfg.training.get('skip_test', False):
         # finish wandb logging
         if is_master(global_rank):
             logging.info('Skipping testing')

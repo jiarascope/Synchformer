@@ -11,6 +11,9 @@ set -euo pipefail
 #   LOG_FREQUENCY=100 \
 #   bash run_stage2_wds_finetune.sh
 
+
+# CUDA_VISIBLE_DEVICES=0 S1_CKPT=/home/jiaray/mrBean/Synchformer/checkpoints/segment_avclip/synchformer_avclip_audioset.pt BATCH_SIZE=4 NUM_WORKERS=2 PREFETCH_FACTOR=1 NUM_EPOCHS=5 CACHE_DECODED=false CACHE_TAR_HANDLES=false DEBUG_IO=false PERSISTENT_WORKERS=true LOG_FREQUENCY=500 LOG_MAX_ITEMS=32 USE_WANDB=false bash /home/jiaray/mrBean/Synchformer/scripts/run_stage2_wds_finetune.sh training.resume=True ckpt_path=/home/jiaray/mrBean/logs/synchformer_stage2_wds/26-06-22T20-31-00/26-06-22T20-31-00_latest.pt start_time=26-06-22T20-31-00
+
 REPO="${REPO:-/home/jiaray/mrBean/Synchformer}"
 TRAIN_TARS="${TRAIN_TARS:-/home/jiaray/mrBean/data/webdataset_clips/train_set}"
 VALID_TARS="${VALID_TARS:-/home/jiaray/mrBean/data/webdataset_clips/valid_set}"
@@ -21,8 +24,8 @@ LOGDIR="${LOGDIR:-/home/jiaray/mrBean/logs/synchformer_stage2_wds}"
 # This is the checkpoint containing both audio and visual feature extractor weights.
 S1_CKPT="${S1_CKPT:-}"
 GPU="${GPU:-0}"
-BATCH_SIZE="${BATCH_SIZE:-2}"
-NUM_WORKERS="${NUM_WORKERS:-1}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 DECODED_CACHE_SIZE="${DECODED_CACHE_SIZE:-0}"
 CACHE_DECODED="${CACHE_DECODED:-false}"
@@ -81,6 +84,7 @@ echo "LOG_MAX_ITEMS=$LOG_MAX_ITEMS"
 echo "CACHE_DECODED=$CACHE_DECODED"
 echo "DECODED_CACHE_SIZE=$DECODED_CACHE_SIZE per worker; cache is worker-local and persists across epochs only with persistent_workers=true"
 echo "TAR_HANDLE_CACHE_SIZE=$TAR_HANDLE_CACHE_SIZE"
+echo "CACHE_TAR_HANDLES=$CACHE_TAR_HANDLES"
 
 set -x
 
@@ -109,7 +113,7 @@ python main.py \
   training.persistent_workers=true \
   training.prefetch_factor="$PREFETCH_FACTOR" \
   training.pin_memory=false \
-  data.dataset.params.debug_io=true \
+  data.dataset.params.debug_io="${DEBUG_IO:-false}" \
   data.dataset.params.worker_threads=1 \
   data.dataset.params.decode_threads=1 \
   training.use_half_precision=true \
@@ -118,6 +122,7 @@ python main.py \
   logging.log_max_items="$LOG_MAX_ITEMS" \
   logging.vis_segment_sim=False \
   logging.log_code_state=False \
-  logging.use_wandb="$USE_WANDB"
+  logging.use_wandb="$USE_WANDB"\
+  "$@"
 
 set +x
