@@ -38,28 +38,23 @@ Notes:
   * Joint mode can create a very large graph. Start with a small directory and
     increase --n-eig/--n-clusters after confirming memory/time behavior.
 
-/home/jiaray/mrBean/Synchformer/data/vggsound/h264_video_25fps_256side_16000hz_aac
-
-/home/jiaray/mrBean/data/ncut_annotated/ncut_smalltest
-
-
-
-    run like
-CUDA_VISIBLE_DEVICES=0 python3 ./scripts/ncut/ncut_audio.py  \
-/home/jiaray/mrBean/data/ncut_annotated/ncut_smalltest\
-  ./outputs/audio/baseline/umap_30  \
- --repo-root /home/jiaray/mrBean/Synchformer  \
+CUDA_VISIBLE_DEVICES=0 python3 ./scripts/visualizers/ncut_audio.py \
+  /home/jiaray/mrBean/data/ncut_annotated/ncut_smalltest \
+  ./outputs/audio/umap_30 \
   --device cuda \
-    --encoder hf_ast  \
-     --avclip-ckpt /home/jiaray/mrBean/Synchformer/checkpoints/segment_avclip/synchformer_avclip_audioset.pt  \
-      --embedder umap \
-        --n-clusters 30  \
-         --n-eig 50
+  --encoder avclip \
+  --avclip-ckpt /home/jiaray/mrBean/Synchformer/checkpoints/segment_avclip/synchformer_avclip_audioset.pt \
+  --embedder umap \
+  --n-clusters 30 \
+  --n-eig 50
+  --no-feature-plot-csv
+
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import shutil
 import subprocess
@@ -809,6 +804,378 @@ def _normalize_rgb(x: np.ndarray) -> np.ndarray:
     return 0.15 + 0.85 * y.astype(np.float32)
 
 
+
+def _stratified_sample_indices(
+    clusters: np.ndarray,
+    max_points: int,
+    seed: int,
+) -> np.ndarray:
+    """Return a deterministic cluster-stratified sample of token indices."""
+    n = int(len(clusters))
+    if max_points <= 0 or n <= max_points:
+        return np.arange(n, dtype=np.int64)
+
+    rng = np.random.default_rng(seed)
+    unique = np.unique(clusters)
+    per_cluster: List[np.ndarray] = []
+    # First allocate approximately proportional samples per cluster while
+    # guaranteeing at least one point for every non-empty cluster.
+    remaining = int(max_points)
+    for c in unique:
+        idx = np.flatnonzero(clusters == c)
+        if len(idx) == 0:
+            continue
+        target = max(1, int(round(max_points * (len(idx) / n))))
+        target = min(target, len(idx), remaining)
+        if target <= 0:
+            continue
+        per_cluster.append(rng.choice(idx, size=target, replace=False))
+        remaining -= target
+        if remaining <= 0:
+            break
+
+    sample = np.concatenate(per_cluster) if per_cluster else np.arange(min(max_points, n), dtype=np.int64)
+    if len(sample) < max_points:
+        chosen = np.zeros(n, dtype=bool)
+        chosen[sample] = True
+        rest = np.flatnonzero(~chosen)
+        extra = rng.choice(rest, size=min(max_points - len(sample), len(rest)), replace=False)
+        sample = np.concatenate([sample, extra])
+    elif len(sample) > max_points:
+        sample = rng.choice(sample, size=max_points, replace=False)
+
+    sample = np.asarray(sample, dtype=np.int64)
+    sample.sort()
+    return sample
+
+
+def _embed_points_2d(
+    points: np.ndarray,
+    method: str,
+    seed: int,
+    metric: str,
+) -> np.ndarray:
+    """Embed feature/eigenvector points to 2D for plotting."""
+    points = np.asarray(points, dtype=np.float32)
+    if points.ndim != 2:
+        raise ValueError(f"Expected 2D points array, got shape {points.shape}")
+    n = int(points.shape[0])
+    if n == 0:
+        raise ValueError("Cannot plot an empty feature set.")
+    if n == 1:
+        return np.zeros((1, 2), dtype=np.float32)
+
+    if method == "umap":
+        try:
+            import umap
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "--embedder umap needs umap-learn for the 2D feature scatter plot. Install it with:\n"
+                "  python3 -m pip install umap-learn"
+            ) from exc
+        reducer = umap.UMAP(
+            n_components=2,
+            n_neighbors=max(2, min(30, n - 1)),
+            min_dist=0.05,
+            metric=metric,
+            random_state=seed,
+        )
+        xy = reducer.fit_transform(points)
+    elif method == "tsne":
+        from sklearn.manifold import TSNE
+        # t-SNE is slow and noisy in very high dimensions. A small PCA pre-step
+        # keeps the plot stable without changing cluster colors or labels.
+        x = points
+        if x.shape[1] > 50 and n > 50:
+            x0 = x - x.mean(axis=0, keepdims=True)
+            _, _, vt = np.linalg.svd(x0, full_matrices=False)
+            x = x0 @ vt[:50].T
+        perplexity = max(2, min(30, (n - 1) // 3))
+        xy = TSNE(
+            n_components=2,
+            perplexity=perplexity,
+            init="pca" if n > 3 else "random",
+            learning_rate="auto",
+            metric=metric,
+            random_state=seed,
+        ).fit_transform(x)
+    else:
+        raise ValueError(method)
+
+    xy = np.asarray(xy, dtype=np.float32)
+    return xy
+
+
+def _build_global_token_metadata(items: Sequence[VideoItem]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return global per-token video ids, local token ids, and spectrogram coords."""
+    total = sum(int(item.token_count) for item in items)
+    video_ids = np.empty(total, dtype=np.int32)
+    local_token_ids = np.empty(total, dtype=np.int64)
+    coords = np.empty((total, 4), dtype=np.int32)
+
+    for vi, item in enumerate(items):
+        s = int(item.token_start)
+        e = int(item.token_end)
+        n = e - s
+        if n != item.token_count:
+            raise RuntimeError(
+                f"Internal token offset mismatch for {item.input_mp4}: "
+                f"offsets give {n}, grid has {item.token_count}"
+            )
+        video_ids[s:e] = vi
+        local_token_ids[s:e] = np.arange(n, dtype=np.int64)
+        coords[s:e] = item.grid.coords.astype(np.int32, copy=False)
+    return video_ids, local_token_ids, coords
+
+
+def _resolve_feature_plot_csv_path(out_png: Path, csv_name: str | None, output_base: Path) -> Path:
+    if csv_name is None:
+        return out_png.with_name(out_png.stem + "_points.csv")
+    out_csv = Path(csv_name).expanduser()
+    if not out_csv.is_absolute():
+        out_csv = output_base / out_csv
+    return out_csv
+
+
+def _write_feature_plot_point_csv(
+    out_csv: Path,
+    sample_idx: np.ndarray,
+    xy: np.ndarray,
+    sampled_clusters: np.ndarray,
+    items: Sequence[VideoItem],
+    video_ids: np.ndarray,
+    local_token_ids: np.ndarray,
+    coords: np.ndarray,
+    frame_shift_ms: float,
+) -> None:
+    """Write exact metadata for every point that appears in the feature plot."""
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    frame_to_sec = float(frame_shift_ms) / 1000.0
+    with out_csv.open("w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "plot_row",
+            "global_token_index",
+            "x",
+            "y",
+            "cluster",
+            "video_index",
+            "video_name",
+            "video_path",
+            "local_token_index",
+            "freq_bin_start",
+            "freq_bin_end",
+            "time_frame_start",
+            "time_frame_end",
+            "time_sec_start",
+            "time_sec_end",
+        ])
+        for row, global_idx in enumerate(sample_idx):
+            vi = int(video_ids[global_idx])
+            item = items[vi]
+            f0, f1, t0, t1 = [int(v) for v in coords[global_idx]]
+            writer.writerow([
+                row,
+                int(global_idx),
+                float(xy[row, 0]),
+                float(xy[row, 1]),
+                int(sampled_clusters[row]),
+                vi,
+                item.input_mp4.name,
+                str(item.input_mp4),
+                int(local_token_ids[global_idx]),
+                f0,
+                f1,
+                t0,
+                t1,
+                float(t0 * frame_to_sec),
+                float(t1 * frame_to_sec),
+            ])
+    print(f"Wrote feature-plot point metadata CSV: {out_csv}")
+
+
+def write_feature_embedding_plot(
+    points: np.ndarray,
+    clusters: np.ndarray,
+    cluster_rgb: np.ndarray,
+    out_png: Path,
+    method: str,
+    seed: int,
+    max_points: int,
+    source_name: str,
+    metric: str,
+    items: Sequence[VideoItem],
+    frame_shift_ms: float,
+    dpi: int = 180,
+    video_markers: bool = True,
+    video_labels: bool = True,
+    video_legend_limit: int = 20,
+    out_csv: Path | None = None,
+    write_csv: bool = True,
+) -> None:
+    """Write a 2D UMAP/t-SNE scatter plot of global token points.
+
+    Each plotted point is one audio patch token. Point face colors are exactly
+    the same cluster RGB values used for the spectrogram mask. Source video is
+    encoded separately with marker shape and optional video-centroid labels, so
+    the plot can show both cluster identity and video provenance.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Writing the feature embedding plot needs matplotlib. Install it with:\n"
+            "  python3 -m pip install matplotlib"
+        ) from exc
+
+    clusters = np.asarray(clusters, dtype=np.int32)
+    if len(items) == 0:
+        raise ValueError("Cannot write video-aware feature plot with zero video items.")
+
+    video_ids, local_token_ids, token_coords = _build_global_token_metadata(items)
+    if len(video_ids) != len(clusters):
+        raise RuntimeError(
+            f"Feature plot metadata has {len(video_ids)} tokens, but clusters has {len(clusters)} labels."
+        )
+
+    sample_idx = _stratified_sample_indices(clusters, max_points=max_points, seed=seed)
+    sampled_points = np.asarray(points[sample_idx], dtype=np.float32)
+    sampled_clusters = clusters[sample_idx]
+    sampled_video_ids = video_ids[sample_idx]
+
+    print(
+        f"Embedding {len(sample_idx):,}/{len(clusters):,} global token points with "
+        f"{method.upper()} for feature scatter plot..."
+    )
+    xy = _embed_points_2d(sampled_points, method=method, seed=seed, metric=metric)
+    colors = cluster_rgb[sampled_clusters]
+
+    if write_csv:
+        if out_csv is None:
+            out_csv = out_png.with_name(out_png.stem + "_points.csv")
+        _write_feature_plot_point_csv(
+            out_csv=out_csv,
+            sample_idx=sample_idx,
+            xy=xy,
+            sampled_clusters=sampled_clusters,
+            items=items,
+            video_ids=video_ids,
+            local_token_ids=local_token_ids,
+            coords=token_coords,
+            frame_shift_ms=frame_shift_ms,
+        )
+
+    x = xy[:, 0]
+    y = xy[:, 1]
+    fig, ax = plt.subplots(figsize=(11.5, 8.5), dpi=dpi)
+
+    marker_cycle = ["o", "s", "^", "v", "D", "P", "X", "*", "<", ">", "h", "H", "p", "8"]
+    if video_markers:
+        # Cluster identity remains the face color. Video identity is marker shape.
+        for vi in np.unique(sampled_video_ids):
+            m = sampled_video_ids == vi
+            marker = marker_cycle[int(vi) % len(marker_cycle)]
+            ax.scatter(
+                x[m],
+                y[m],
+                s=6.0,
+                c=colors[m],
+                alpha=0.78,
+                linewidths=0,
+                marker=marker,
+            )
+    else:
+        ax.scatter(x, y, s=3.0, c=colors, alpha=0.75, linewidths=0)
+
+    # Draw cluster centroids in the same colors, with labels, for readability.
+    for c in range(int(cluster_rgb.shape[0])):
+        m = sampled_clusters == c
+        if not np.any(m):
+            continue
+        cx = float(np.median(x[m]))
+        cy = float(np.median(y[m]))
+        ax.scatter([cx], [cy], s=44, c=[cluster_rgb[c]], edgecolors="black", linewidths=0.5)
+        ax.text(cx, cy, str(c), fontsize=7, ha="center", va="center", color="black")
+
+    if video_labels:
+        # Label one robust center per source video. This is intentionally separate
+        # from cluster labels: numbers = clusters, vN/name = video provenance.
+        for vi in np.unique(sampled_video_ids):
+            m = sampled_video_ids == vi
+            if not np.any(m):
+                continue
+            vx = float(np.median(x[m]))
+            vy = float(np.median(y[m]))
+            name = items[int(vi)].input_mp4.stem
+            label = f"v{int(vi)}: {name}"
+            ax.text(
+                vx,
+                vy,
+                label,
+                fontsize=7,
+                ha="left",
+                va="bottom",
+                color="black",
+                bbox=dict(facecolor="white", alpha=0.70, edgecolor="none", pad=1.5),
+            )
+
+    if video_markers and len(items) <= int(video_legend_limit):
+        handles = []
+        for vi, item in enumerate(items):
+            marker = marker_cycle[vi % len(marker_cycle)]
+            handles.append(Line2D(
+                [0], [0],
+                marker=marker,
+                linestyle="None",
+                color="black",
+                markerfacecolor="none",
+                markeredgecolor="black",
+                markersize=6,
+                label=f"v{vi}: {item.input_mp4.name}",
+            ))
+        ax.legend(
+            handles=handles,
+            title="Source video (marker shape)",
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            fontsize=7,
+            title_fontsize=8,
+            frameon=True,
+        )
+
+    ax.set_title(f"Global audio token {method.upper()} ({source_name})")
+    ax.set_xlabel(f"{method.upper()} 1")
+    ax.set_ylabel(f"{method.upper()} 2")
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.grid(False)
+    footer = (
+        f"{len(sample_idx):,}/{len(clusters):,} tokens plotted; "
+        "color=NCut cluster/spectrogram color"
+    )
+    if video_markers:
+        footer += "; marker shape/source label=video"
+    if write_csv:
+        footer += "; CSV gives exact point-to-video/token mapping"
+    ax.text(
+        0.01,
+        0.01,
+        footer,
+        transform=ax.transAxes,
+        fontsize=8,
+        ha="left",
+        va="bottom",
+    )
+    fig.tight_layout()
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png)
+    plt.close(fig)
+    print(f"Wrote global feature embedding plot: {out_png}")
+
 def rasterize_mask(
     coords: np.ndarray,
     clusters: np.ndarray,
@@ -1179,6 +1546,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-eig", type=int, default=24)
     p.add_argument("--n-clusters", type=int, default=12)
     p.add_argument("--embedder", choices=["umap", "tsne"], default="umap")
+    p.add_argument("--no-feature-plot", action="store_true",
+                   help="Disable writing the global 2D feature scatter plot.")
+    p.add_argument("--feature-plot-name", default=None,
+                   help="Output PNG name/path for the global feature scatter plot. Default: joint_feature_<embedder>.png in the output directory.")
+    p.add_argument("--feature-plot-source", choices=["features", "ncut"], default="features",
+                   help="Points to embed in the scatter plot. 'features' plots AVCLIP/AST token features; 'ncut' plots NCut eigenvectors. Default: features.")
+    p.add_argument("--feature-plot-max-points", type=int, default=50000,
+                   help="Max token points to draw in the feature plot. 0 means plot all points. Default: 50000.")
+    p.add_argument("--feature-plot-metric", default=None,
+                   help="Distance metric for the 2D plot embedding. Default: cosine for raw features, euclidean for NCut eigenvectors.")
+    p.add_argument("--feature-plot-dpi", type=int, default=180)
+    p.add_argument("--no-feature-plot-video-markers", action="store_true",
+                   help="Do not encode source video by marker shape in the feature plot. Cluster colors are still used.")
+    p.add_argument("--no-feature-plot-video-labels", action="store_true",
+                   help="Do not draw source-video centroid labels on the feature plot.")
+    p.add_argument("--feature-plot-video-legend-limit", type=int, default=20,
+                   help="Draw a video marker legend only when the number of videos is <= this value. Default: 20.")
+    p.add_argument("--feature-plot-csv-name", default=None,
+                   help="CSV name/path for per-point plot metadata. Default: <feature_plot_stem>_points.csv next to the PNG.")
+    p.add_argument("--no-feature-plot-csv", action="store_true",
+                   help="Disable writing the CSV that maps every plotted point to video/token coordinates.")
     p.add_argument("--alpha", type=float, default=0.5, help="Mask opacity over spectrogram.")
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--width", type=int, default=1920)
@@ -1256,6 +1644,58 @@ def main() -> None:
 
         print(f"Coloring global clusters with {args.embedder.upper()}...")
         cluster_rgb = embed_cluster_colors(eigvecs, clusters, args.embedder, args.seed)
+
+        if not args.no_feature_plot:
+            if args.feature_plot_source == "features":
+                plot_points = F.normalize(global_features, dim=-1).float().cpu().numpy()
+                plot_source_name = "AVCLIP audio token features" if args.encoder == "avclip" else "AST audio token features"
+                plot_metric = args.feature_plot_metric or "cosine"
+            else:
+                plot_points = eigvecs.astype(np.float32)
+                plot_source_name = "NCut eigenvectors"
+                plot_metric = args.feature_plot_metric or "euclidean"
+
+            if args.feature_plot_name is None:
+                feature_plot_out = (
+                    output_path.parent / f"joint_feature_{args.embedder}.png"
+                    if single_file_mode
+                    else output_path / f"joint_feature_{args.embedder}.png"
+                )
+            else:
+                feature_plot_out = Path(args.feature_plot_name).expanduser()
+                if not feature_plot_out.is_absolute():
+                    base_dir = output_path.parent if single_file_mode else output_path
+                    feature_plot_out = base_dir / feature_plot_out
+
+            if args.no_feature_plot_csv:
+                feature_plot_csv_out = None
+            else:
+                csv_base_dir = output_path.parent if single_file_mode else output_path
+                feature_plot_csv_out = _resolve_feature_plot_csv_path(
+                    out_png=feature_plot_out,
+                    csv_name=args.feature_plot_csv_name,
+                    output_base=csv_base_dir,
+                )
+
+            write_feature_embedding_plot(
+                points=plot_points,
+                clusters=clusters,
+                cluster_rgb=cluster_rgb,
+                out_png=feature_plot_out,
+                method=args.embedder,
+                seed=args.seed,
+                max_points=args.feature_plot_max_points,
+                source_name=plot_source_name,
+                metric=plot_metric,
+                items=items,
+                frame_shift_ms=args.frame_shift_ms,
+                dpi=args.feature_plot_dpi,
+                video_markers=not args.no_feature_plot_video_markers,
+                video_labels=not args.no_feature_plot_video_labels,
+                video_legend_limit=args.feature_plot_video_legend_limit,
+                out_csv=feature_plot_csv_out,
+                write_csv=not args.no_feature_plot_csv,
+            )
 
         overlays_for_grid: List[Tuple[Path, np.ndarray]] = []
         for i, item in enumerate(items):
