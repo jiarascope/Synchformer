@@ -31,7 +31,7 @@ from torch import nn, optim
 from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 
 class LoRALinear(nn.Module):
@@ -95,6 +95,30 @@ def clean_state_dict_keys(sd: Mapping[str, torch.Tensor]) -> Dict[str, torch.Ten
             out = {k[len(prefix):]: v for k, v in out.items()}
     return out
 
+def ensure_train_clip_compat_defaults(cfg: Any) -> None:
+    """
+    Fill missing OpenCLIP/Synchformer training keys expected by train_one_epoch().
+    This only modifies the in-memory cfg object in this standalone script.
+    It does not patch repo files or config files.
+    """
+    with open_dict(cfg):
+        if "distill" not in cfg:
+            cfg.distill = False
+
+        if "transform_sequence_train" not in cfg:
+            if "data" in cfg and "transform_sequence_train" in cfg.data:
+                cfg.transform_sequence_train = cfg.data.transform_sequence_train
+            else:
+                cfg.transform_sequence_train = []
+
+        if "transform_sequence_test" not in cfg:
+            if "data" in cfg and "transform_sequence_test" in cfg.data:
+                cfg.transform_sequence_test = cfg.data.transform_sequence_test
+            else:
+                cfg.transform_sequence_test = []
+
+        if "training" in cfg and "skip_scheduler" not in cfg.training:
+            cfg.training.skip_scheduler = False
 
 def extract_state_dict(ckpt: Any) -> Dict[str, torch.Tensor]:
     if isinstance(ckpt, Mapping):
@@ -175,9 +199,17 @@ def apply_lora_to_module(
             continue
 
         parent, child_name = get_parent_module(root, local_name)
+
+        # Do not wrap torch.nn.MultiheadAttention.out_proj.
+        # MultiheadAttention.forward() directly reads out_proj.weight/out_proj.bias
+        # instead of calling out_proj(x), so replacing it with LoRALinear breaks forward().
+        # Also, LoRA would not actually be applied there unless we replaced the whole MHA.
+        if isinstance(parent, nn.MultiheadAttention):
+            logging.info("Skipping LoRA for nn.MultiheadAttention child: %s", full_name)
+            continue
+
         setattr(parent, child_name, LoRALinear(module, rank=rank, alpha=alpha, dropout=dropout))
         replaced.append(full_name)
-
     return replaced
 
 
@@ -388,6 +420,19 @@ def save_checkpoints(
     logging.info("Saved LoRA-resume checkpoint: %s", lora_path)
 
 
+def add_boolean_optional_argument(
+    parser: argparse.ArgumentParser,
+    name: str,
+    *,
+    default: bool,
+    help: Optional[str] = None,
+) -> None:
+    """Backport argparse.BooleanOptionalAction for Python 3.8 environments."""
+    dest = name.lstrip("-").replace("-", "_")
+    parser.add_argument(name, dest=dest, action="store_true", default=default, help=help)
+    parser.add_argument(f"--no-{name.lstrip('--')}", dest=dest, action="store_false")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--repo", required=True, type=Path, help="Path to Synchformer repo root")
@@ -403,10 +448,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--lora-alpha", type=float, default=16.0)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
-    parser.add_argument("--train-logit-scale", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--train-layer-norm", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--train-bias", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--train-proj", action=argparse.BooleanOptionalAction, default=False)
+    add_boolean_optional_argument(parser, "--train-logit-scale", default=True)
+    add_boolean_optional_argument(parser, "--train-layer-norm", default=False)
+    add_boolean_optional_argument(parser, "--train-bias", default=False)
+    add_boolean_optional_argument(parser, "--train-proj", default=False)
 
     parser.add_argument(
         "overrides",
@@ -457,6 +502,7 @@ def main() -> int:
             pass
     OmegaConf.resolve(cfg)
     cfg_sanity_check_and_patch(cfg)
+    ensure_train_clip_compat_defaults(cfg)
 
     if cfg.action != "train_avclip":
         raise RuntimeError(f"This script is only for stage-1 AVCLIP training. Got cfg.action={cfg.action!r}")

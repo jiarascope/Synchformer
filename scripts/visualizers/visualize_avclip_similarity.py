@@ -11,6 +11,8 @@ Long-video behavior:
   passed through the Stage-1 AVCLIP model, segment features are concatenated, and
   full-video similarity matrices are computed from all extracted segment features.
 
+/home/jiaray/mrBean/data/baseline_data/conducting_clips
+
 Example:
   python scripts/visualizers/visualize_avclip_similarity_any_length.py \
     --cfg configs/segment_avclip.yaml \
@@ -18,6 +20,13 @@ Example:
     --vids /path/to/long_video.mp4 \
     --out /path/to/similarity.png \
     --npz /path/to/similarity.npz
+
+python scripts/visualizers/visualize_avclip_similarity.py \
+  --cfg configs/segment_avclip.yaml \
+  --checkpoint checkpoints/segment_avclip/synchformer_avclip_audioset.pt \
+  --video-dir /home/jiaray/mrBean/data/baseline_data/conducting_clips \
+  --out /home/jiaray/mrBean/plots/baseline
+
 """
 
 import argparse

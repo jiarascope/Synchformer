@@ -12,7 +12,7 @@ from .process_common import (
     group_records_by_key,
     make_window_starts,
     run_embedding_pipeline,
-    write_held_mask_overlay_videos,
+    write_held_mask_overlay_video,
 )
 from .video_io import get_video_info, iter_videos
 
@@ -83,11 +83,12 @@ def process_video_directory_joint_ncut(
     # 2. Run ONE NCut over all tokens from all videos.
     # ------------------------------------------------------------------
     print(f"[joint] running one NCut over all videos with num_eig={args.num_eig}")
-    eig_all, labels_all, rgb_all = run_embedding_pipeline(
+    eig_all, _labels_all, rgb_all = run_embedding_pipeline(
         X_all,
         args=args,
         device=device,
         rgb=True,
+        clusters=False,
     )
     assert rgb_all is not None
 
@@ -97,10 +98,8 @@ def process_video_directory_joint_ncut(
         f"{eig_dims} eigenvectors"
     )
 
-    print("[joint] ran shared k-means on joint NCut embedding")
-
     # ------------------------------------------------------------------
-    # 3. Write one output video per input video.
+    # 3. Write one RGB overlay video per input video.
     # ------------------------------------------------------------------
     by_video = group_records_by_key(records, "video_path")
 
@@ -115,21 +114,17 @@ def process_video_directory_joint_ncut(
 
         print(f"[joint] writing overlays for {stem}")
 
-        rgb_mask_accum, cluster_prob_accum, mask_count = accumulate_masks_for_video(
+        rgb_mask_accum, mask_count = accumulate_masks_for_video(
             records=video_records,
             rgb_flat=rgb_all,
-            labels_flat=labels_all,
             total_frames=total_frames,
             out_size=out_size,
-            num_clusters=args.num_clusters,
         )
 
-        write_held_mask_overlay_videos(
+        write_held_mask_overlay_video(
             video_path=video_path,
             rgb_out_path=out_dir / f"{stem}_joint_{args.embedding_map}_rgb_overlay.mp4",
-            cluster_out_path=out_dir / f"{stem}_joint_clusters_overlay.mp4",
             rgb_mask_accum=rgb_mask_accum,
-            cluster_prob_accum=cluster_prob_accum,
             mask_count=mask_count,
             video_fps=video_fps,
             out_size=out_size,

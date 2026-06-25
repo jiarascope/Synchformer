@@ -39,8 +39,8 @@ Notes:
     increase --n-eig/--n-clusters after confirming memory/time behavior.
 
 CUDA_VISIBLE_DEVICES=0 python3 ./scripts/visualizers/ncut_audio.py \
-  /home/jiaray/mrBean/data/ncut_annotated/ncut_smalltest \
-  ./outputs/audio/umap_30 \
+  /home/jiaray/mrBean/data/baseline_data/-XUgwM_clips \
+  /home/jiaray/mrBean/plots/baseline/single_vid \
   --device cuda \
   --encoder avclip \
   --avclip-ckpt /home/jiaray/mrBean/Synchformer/checkpoints/segment_avclip/synchformer_avclip_audioset.pt \

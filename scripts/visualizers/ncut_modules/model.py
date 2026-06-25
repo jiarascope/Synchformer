@@ -22,8 +22,18 @@ def load_visual_encoder_from_synchformer(
     That should preserve spatiotemporal patch tokens instead of pooling them
     into one vector per segment/frame.
     """
-    import sys
-    sys.path.insert(0, str(repo_root))
+    repo_root = repo_root.resolve()
+    visual_module_root = repo_root / "model" / "modules" / "feat_extractors" / "visual"
+    for path in (repo_root, visual_module_root):
+        path_str = str(path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+
+    if checkpoint is not None:
+        checkpoint_path = Path(checkpoint)
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = repo_root / checkpoint_path
+        checkpoint = str(checkpoint_path)
 
     from model.modules.feat_extractors.visual.motionformer import MotionFormer
 

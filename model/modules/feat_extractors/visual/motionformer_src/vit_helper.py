@@ -110,7 +110,7 @@ class DividedAttention(nn.Module):
             tok_mask = tok_mask.unsqueeze(1).expand(-1, h, -1).reshape(-1, tok_mask.shape[1])
 
         # Scale q
-        q *= self.scale
+        q = q * self.scale
 
         # Take out cls_q, cls_k, cls_v
         (cls_q, q_), (cls_k, k_), (cls_v, v_) = map(lambda t: (t[:, 0:1], t[:, 1:]), (q, k, v))

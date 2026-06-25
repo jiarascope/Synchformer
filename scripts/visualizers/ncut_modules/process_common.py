@@ -282,23 +282,26 @@ def run_embedding_pipeline(
     args: argparse.Namespace,
     device: torch.device,
     rgb: bool = False,
-) -> Tuple[torch.Tensor, np.ndarray, Optional[np.ndarray]]:
+    clusters: bool = True,
+) -> Tuple[torch.Tensor, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Run the common NCut+k-means pipeline, optionally also returning mapped RGB.
 
     Returns:
         eig: CPU tensor [N,K]
-        labels: numpy array [N]
+        labels: optional numpy array [N]
         rgb_flat: optional uint8 array [N,3]
     """
     eig = run_ncut_embedding(tokens_flat, num_eig=args.num_eig, device=device)
-    labels = cluster_embedding(
-        eig,
-        num_eig=args.num_eig,
-        kmeans_dims=args.kmeans_dims,
-        num_clusters=args.num_clusters,
-        seed=args.seed,
-    )
+    labels = None
+    if clusters:
+        labels = cluster_embedding(
+            eig,
+            num_eig=args.num_eig,
+            kmeans_dims=args.kmeans_dims,
+            num_clusters=args.num_clusters,
+            seed=args.seed,
+        )
     rgb_flat = embedding_to_rgb(eig, args=args) if rgb else None
     return eig, labels, rgb_flat
 
@@ -457,17 +460,14 @@ def accumulate_masks_for_video(
     *,
     records: Iterable[Mapping[str, Any]],
     rgb_flat: np.ndarray,
-    labels_flat: np.ndarray,
     total_frames: int,
     out_size: Tuple[int, int],
-    num_clusters: int,
-) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray], Dict[int, int]]:
+) -> Tuple[Dict[int, np.ndarray], Dict[int, int]]:
     """
-    Joint-directory path: accumulate continuous RGB masks and cluster
-    probabilities at sampled global frame indices.
+    Joint-directory path: accumulate continuous RGB masks at sampled global
+    frame indices.
     """
     rgb_mask_accum: Dict[int, np.ndarray] = {}
-    cluster_prob_accum: Dict[int, np.ndarray] = {}
     mask_count: Dict[int, int] = {}
 
     for rec in records:
@@ -476,7 +476,6 @@ def accumulate_masks_for_video(
         T_tok, H_tok, W_tok, _ = rec["tokens_shape"]
 
         rgb_seg = rgb_flat[offset : offset + n_tokens].reshape(T_tok, H_tok, W_tok, 3)
-        labels_seg = labels_flat[offset : offset + n_tokens].reshape(T_tok, H_tok, W_tok)
         sampled_indices = rec["sampled_indices"]
 
         for t in range(T_tok):
@@ -493,51 +492,37 @@ def accumulate_masks_for_video(
                 interpolation=cv2.INTER_NEAREST,
             ).astype(np.float32)
 
-            # Discrete clusters: accumulate probabilities, not colors.
-            onehot = np.eye(num_clusters, dtype=np.float32)[labels_seg[t]]
-            onehot = cv2.resize(
-                onehot,
-                out_size,
-                interpolation=cv2.INTER_LINEAR,
-            ).astype(np.float32)
-
             if global_frame_idx not in rgb_mask_accum:
                 rgb_mask_accum[global_frame_idx] = rgb_mask
-                cluster_prob_accum[global_frame_idx] = onehot
                 mask_count[global_frame_idx] = 1
             else:
                 rgb_mask_accum[global_frame_idx] += rgb_mask
-                cluster_prob_accum[global_frame_idx] += onehot
                 mask_count[global_frame_idx] += 1
 
-    return rgb_mask_accum, cluster_prob_accum, mask_count
+    return rgb_mask_accum, mask_count
 
 
-def write_held_mask_overlay_videos(
+def write_held_mask_overlay_video(
     *,
     video_path: Path,
     rgb_out_path: Path,
-    cluster_out_path: Path,
     rgb_mask_accum: Mapping[int, np.ndarray],
-    cluster_prob_accum: Mapping[int, np.ndarray],
     mask_count: Mapping[int, int],
     video_fps: float,
     out_size: Tuple[int, int],
     max_duration_sec: Optional[float],
     alpha: float,
 ) -> None:
-    """Decode a video and overlay the latest accumulated masks on each frame."""
+    """Decode a video and overlay the latest accumulated RGB mask on each frame."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     rgb_writer = cv2.VideoWriter(str(rgb_out_path), fourcc, video_fps, out_size)
-    cluster_writer = cv2.VideoWriter(str(cluster_out_path), fourcc, video_fps, out_size)
 
     frame_idx = 0
     last_rgb_mask: Optional[np.ndarray] = None
-    last_cluster_rgb: Optional[np.ndarray] = None
 
     while True:
         ok, frame_bgr = cap.read()
@@ -554,26 +539,15 @@ def write_held_mask_overlay_videos(
             n = mask_count[frame_idx]
             last_rgb_mask = (rgb_mask_accum[frame_idx] / n).clip(0, 255).astype(np.uint8)
 
-            cluster_probs = cluster_prob_accum[frame_idx] / n
-            cluster_labels = cluster_probs.argmax(axis=-1)
-            last_cluster_rgb = labels_to_rgb(cluster_labels)
-
         rgb_frame = (
             overlay_rgb(frame_rgb, last_rgb_mask, alpha=alpha)
             if last_rgb_mask is not None
             else frame_rgb
         )
-        cluster_frame = (
-            overlay_rgb(frame_rgb, last_cluster_rgb, alpha=alpha)
-            if last_cluster_rgb is not None
-            else frame_rgb
-        )
 
         rgb_writer.write(cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR))
-        cluster_writer.write(cv2.cvtColor(cluster_frame, cv2.COLOR_RGB2BGR))
 
         frame_idx += 1
 
     cap.release()
     rgb_writer.release()
-    cluster_writer.release()

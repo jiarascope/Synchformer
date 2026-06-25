@@ -7,10 +7,10 @@ videos in an input directory and writes only mp4 overlay videos to `--out_dir`.
 
 ```bash
 python3 ncut_video.py \
-  --repo_root . \
+  --repo_root /home/jiaray/mrBean/Synchformer \
   --checkpoint checkpoints/segment_avclip/synchformer_avclip_audioset.pt \
-  --video_dir /home/jiaray/mrBean/data/ncut_smalltest \
-  --out_dir outputs/joint_ncut \
+  --video_dir /home/jiaray/mrBean/data/baseline_data/conducting_clips \
+  --out_dir /home/jiaray/mrBean/plots/baseline \
   --embedding_map umap \
   --segment_sec 0.64 \
   --stride_sec 0.32 \
@@ -20,7 +20,7 @@ python3 ncut_video.py \
   --patch_size 16 \
   --num_eig 50 \
   --eig_rgb_dims 50 \
-  --num_clusters 6 \
+  --num_clusters 30 \
   --alpha 0.55 \
   --device cuda
 ```

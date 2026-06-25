@@ -5,7 +5,7 @@ set -euo pipefail
 #   REPO=/home/jiaray/mrBean/Synchformer \
 #   TRAIN_TARS=/home/jiaray/mrBean/data/train_tars \
 #   VALID_TARS=/home/jiaray/mrBean/data/valid_tars \
-#   S1_CKPT=/home/jiaray/mrBean/checkpoints/feature_extractors/epoch_best.pt \
+#   S1_CKPT=/home/jiaray/mrBean/Synchformer/checkpoints/segment_avclip/synchformer_avclip_audioset.pt \
 #   NUM_EPOCHS=5 \
 #   LOG_MAX_ITEMS=512 \
 #   LOG_FREQUENCY=100 \
