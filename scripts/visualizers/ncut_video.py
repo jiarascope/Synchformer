@@ -20,7 +20,13 @@ def parse_args():
 
     parser.add_argument("--repo_root", type=str, default=".", help="Path to Synchformer repo root.")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to Synchformer/Motionformer checkpoint.")
-    parser.add_argument("--video_dir", type=str, required=True)
+    parser.add_argument(
+        "--video_dir",
+        type=str,
+        nargs="+",
+        required=True,
+        help="One or more directories containing videos to include in a single joint NCut.",
+    )
     parser.add_argument("--out_dir", type=str, default="outputs/ncut_motionformer")
 
     parser.add_argument("--num_frames", type=int, default=8)
@@ -88,7 +94,7 @@ def main():
     visual_encoder.eval()
 
     process_video_directory_joint_ncut(
-        video_dir=Path(args.video_dir),
+        video_dirs=[Path(video_dir) for video_dir in args.video_dir],
         out_root=out_root,
         visual_encoder=visual_encoder,
         device=device,

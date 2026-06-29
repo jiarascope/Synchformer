@@ -64,7 +64,7 @@ S1_CKPT="${S1_CKPT:-}"
 RESUME_LORA="${RESUME_LORA:-}"
 ALLOW_NONSTRICT_S1_LOAD="${ALLOW_NONSTRICT_S1_LOAD:-false}"
 
-GPU="${GPU:-0}"
+GPU="${GPU:-${CUDA_VISIBLE_DEVICES:-0}}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
@@ -108,6 +108,13 @@ USE_WANDB="${USE_WANDB:-false}"
 DEBUG_SHELL="${DEBUG_SHELL:-false}"
 PRINT_ENV="${PRINT_ENV:-false}"
 
+# Launch mode knobs.
+# DDP=auto uses torchrun when GPU contains a comma, e.g. GPU=0,1.
+# BATCH_SIZE is per GPU/rank under DDP.
+DDP="${DDP:-auto}"                       # auto | true | false
+NPROC_PER_NODE="${NPROC_PER_NODE:-}"     # defaults to number of comma-separated GPUs
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128}"
+
 mkdir -p "$LOGDIR"
 RUN_LOG="$LOGDIR/run_stage1_lora_wds_$(date +%Y%m%d_%H%M%S).log"
 TEE_FIFO="$(mktemp -u "${TMPDIR:-/tmp}/run_stage1_lora_wds.XXXXXX")"
@@ -149,6 +156,9 @@ fi
 if [[ ! -e "$S1_CKPT" ]]; then
   die "S1_CKPT does not exist: $S1_CKPT"
 fi
+if [[ -n "$RESUME_LORA" && ! -e "$RESUME_LORA" ]]; then
+  die "RESUME_LORA does not exist: $RESUME_LORA"
+fi
 
 cd "$REPO"
 log "Working directory: $(pwd)"
@@ -157,7 +167,35 @@ if [[ ! -d "$TRAIN_TARS" ]]; then warn "TRAIN_TARS directory does not exist: $TR
 if [[ ! -d "$VALID_TARS" ]]; then warn "VALID_TARS directory does not exist: $VALID_TARS"; fi
 if [[ ! -d "$TEST_TARS" ]]; then warn "TEST_TARS directory does not exist: $TEST_TARS"; fi
 
+# Resolve DDP mode before launching.
+if [[ -z "$NPROC_PER_NODE" ]]; then
+  if [[ "$GPU" == *,* ]]; then
+    NPROC_PER_NODE="$(awk -F',' '{print NF}' <<< "$GPU")"
+  else
+    NPROC_PER_NODE="1"
+  fi
+fi
+
+if [[ "$DDP" == "auto" ]]; then
+  if [[ "$NPROC_PER_NODE" -gt 1 ]]; then
+    DDP="true"
+  else
+    DDP="false"
+  fi
+fi
+
+if [[ "$DDP" != "true" && "$DDP" != "false" ]]; then
+  die "DDP must be auto, true, or false; got: $DDP"
+fi
+if [[ "$DDP" == "true" && "$NPROC_PER_NODE" -lt 2 ]]; then
+  die "DDP=true requires NPROC_PER_NODE >= 2 or GPU with multiple comma-separated ids; got GPU=$GPU NPROC_PER_NODE=$NPROC_PER_NODE"
+fi
+if [[ "$DDP" == "false" && "$GPU" == *,* ]]; then
+  warn "GPU=$GPU exposes multiple GPUs but DDP=false, so only one process will run. Use DDP=true or DDP=auto for multi-GPU."
+fi
+
 export CUDA_VISIBLE_DEVICES="$GPU"
+export PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
@@ -186,6 +224,10 @@ print_kv "S1_CKPT" "$S1_CKPT"
 print_kv "RESUME_LORA" "${RESUME_LORA:-<none>}"
 print_kv "ALLOW_NONSTRICT_S1_LOAD" "$ALLOW_NONSTRICT_S1_LOAD"
 print_kv "CUDA_VISIBLE_DEVICES" "$CUDA_VISIBLE_DEVICES"
+print_kv "PYTORCH_CUDA_ALLOC_CONF" "$PYTORCH_CUDA_ALLOC_CONF"
+print_kv "DDP" "$DDP"
+print_kv "NPROC_PER_NODE" "$NPROC_PER_NODE"
+print_kv "BATCH_SIZE_MEANING" "$([[ "$DDP" == "true" ]] && printf 'per GPU/rank' || printf 'single process')"
 print_kv "BATCH_SIZE" "$BATCH_SIZE"
 print_kv "NUM_WORKERS" "$NUM_WORKERS"
 print_kv "PREFETCH_FACTOR" "$PREFETCH_FACTOR"
@@ -245,88 +287,63 @@ if [[ "$TRAIN_PROJ" == "true" ]]; then PY_ARGS+=(--train-proj); else PY_ARGS+=(-
 if [[ -n "$RESUME_LORA" ]]; then PY_ARGS+=(--resume-lora "$RESUME_LORA"); fi
 if [[ "$ALLOW_NONSTRICT_S1_LOAD" == "true" ]]; then PY_ARGS+=(--allow-nonstrict-s1-load); fi
 
+CFG_OVERRIDES=(
+  logging.logdir="$LOGDIR"
+  logging.log_frequency="$LOG_FREQUENCY"
+  logging.log_max_items="$LOG_MAX_ITEMS"
+  logging.log_code_state=false
+  logging.use_wandb="$USE_WANDB"
+  logging.log_local="$([[ "$DDP" == "true" ]] && printf true || printf false)"
+  data.vids_path="$TRAIN_TARS"
+  data.dataset.target=dataset.webdataset_tar_inmemory_cached_sync.WebDatasetTarInMemoryCachedSync
+  data.dataset.params.train_vids_dir="$TRAIN_TARS"
+  data.dataset.params.valid_vids_dir="$VALID_TARS"
+  data.dataset.params.test_vids_dir="$TEST_TARS"
+  data.dataset.params.recursive="$RECURSIVE"
+  data.dataset.params.cache_decoded="$CACHE_DECODED"
+  data.dataset.params.decoded_cache_size="$DECODED_CACHE_SIZE"
+  data.dataset.params.cache_tar_handles="$CACHE_TAR_HANDLES"
+  data.dataset.params.tar_handle_cache_size="$TAR_HANDLE_CACHE_SIZE"
+  data.dataset.params.clone_cached_tensors=false
+  data.dataset.params.max_clip_len_sec="$MAX_CLIP_LEN_SEC"
+  data.dataset.params.strict_video_fps="$STRICT_VIDEO_FPS"
+  data.dataset.params.strict_audio_fps="$STRICT_AUDIO_FPS"
+  data.dataset.params.debug_io="$DEBUG_IO"
+  data.dataset.params.profile_io="$PROFILE_IO"
+  data.dataset.params.worker_threads=1
+  data.dataset.params.decode_threads=1
+  training.base_batch_size="$BATCH_SIZE"
+  training.num_workers="$NUM_WORKERS"
+  training.num_epochs="$NUM_EPOCHS"
+  training.learning_rate="$LEARNING_RATE"
+  training.persistent_workers="$PERSISTENT_WORKERS"
+  training.prefetch_factor="$PREFETCH_FACTOR"
+  training.pin_memory="$PIN_MEMORY"
+  training.precision=amp
+  training.use_half_precision=true
+  training.skip_test=true
+  training.for_loop_segment_fwd="$FOR_LOOP_SEGMENT_FWD"
+  training.run_shifted_win_val="$RUN_SHIFTED_WIN_VAL"
+  training.val_frequency="$VAL_FREQUENCY"
+  data.n_segments_train="$N_SEGMENTS"
+  data.n_segments_valid="$N_SEGMENTS"
+  model.params.afeat_extractor.params.max_segments="$N_SEGMENTS"
+  model.params.vfeat_extractor.params.max_segments="$N_SEGMENTS"
+)
+
 log "Launching LoRA training"
-printf '  python'
-printf ' %q' "${PY_ARGS[@]}" --
-printf ' %q' \
-  logging.logdir="$LOGDIR" \
-  logging.log_frequency="$LOG_FREQUENCY" \
-  logging.log_max_items="$LOG_MAX_ITEMS" \
-  logging.log_code_state=false \
-  logging.use_wandb="$USE_WANDB" \
-  data.vids_path="$TRAIN_TARS" \
-  data.dataset.target=dataset.webdataset_tar_inmemory_cached_sync.WebDatasetTarInMemoryCachedSync \
-  data.dataset.params.train_vids_dir="$TRAIN_TARS" \
-  data.dataset.params.valid_vids_dir="$VALID_TARS" \
-  data.dataset.params.test_vids_dir="$TEST_TARS" \
-  data.dataset.params.recursive="$RECURSIVE" \
-  data.dataset.params.cache_decoded="$CACHE_DECODED" \
-  data.dataset.params.decoded_cache_size="$DECODED_CACHE_SIZE" \
-  data.dataset.params.cache_tar_handles="$CACHE_TAR_HANDLES" \
-  data.dataset.params.tar_handle_cache_size="$TAR_HANDLE_CACHE_SIZE" \
-  data.dataset.params.clone_cached_tensors=false \
-  data.dataset.params.max_clip_len_sec="$MAX_CLIP_LEN_SEC" \
-  data.dataset.params.strict_video_fps="$STRICT_VIDEO_FPS" \
-  data.dataset.params.strict_audio_fps="$STRICT_AUDIO_FPS" \
-  data.dataset.params.debug_io="$DEBUG_IO" \
-  data.dataset.params.profile_io="$PROFILE_IO" \
-  data.dataset.params.worker_threads=1 \
-  data.dataset.params.decode_threads=1 \
-  training.base_batch_size="$BATCH_SIZE" \
-  training.num_workers="$NUM_WORKERS" \
-  training.num_epochs="$NUM_EPOCHS" \
-  training.learning_rate="$LEARNING_RATE" \
-  training.persistent_workers="$PERSISTENT_WORKERS" \
-  training.prefetch_factor="$PREFETCH_FACTOR" \
-  training.pin_memory="$PIN_MEMORY" \
-  training.precision=amp \
-  training.for_loop_segment_fwd="$FOR_LOOP_SEGMENT_FWD" \
-  training.run_shifted_win_val="$RUN_SHIFTED_WIN_VAL" \
-  training.val_frequency="$VAL_FREQUENCY" \
-  data.n_segments_train="$N_SEGMENTS" \
-  data.n_segments_valid="$N_SEGMENTS" \
-  "$@"
+if [[ "$DDP" == "true" ]]; then
+  LAUNCH_CMD=(torchrun --standalone --nproc_per_node="$NPROC_PER_NODE")
+else
+  LAUNCH_CMD=(python)
+fi
+
+printf '  '
+printf ' %q' "${LAUNCH_CMD[@]}" "${PY_ARGS[@]}" -- "${CFG_OVERRIDES[@]}" "$@"
 printf '\n'
 
 set +e
-python "${PY_ARGS[@]}" -- \
-  logging.logdir="$LOGDIR" \
-  logging.log_frequency="$LOG_FREQUENCY" \
-  logging.log_max_items="$LOG_MAX_ITEMS" \
-  logging.log_code_state=false \
-  logging.use_wandb="$USE_WANDB" \
-  data.vids_path="$TRAIN_TARS" \
-  data.dataset.target=dataset.webdataset_tar_inmemory_cached_sync.WebDatasetTarInMemoryCachedSync \
-  data.dataset.params.train_vids_dir="$TRAIN_TARS" \
-  data.dataset.params.valid_vids_dir="$VALID_TARS" \
-  data.dataset.params.test_vids_dir="$TEST_TARS" \
-  data.dataset.params.recursive="$RECURSIVE" \
-  data.dataset.params.cache_decoded="$CACHE_DECODED" \
-  data.dataset.params.decoded_cache_size="$DECODED_CACHE_SIZE" \
-  data.dataset.params.cache_tar_handles="$CACHE_TAR_HANDLES" \
-  data.dataset.params.tar_handle_cache_size="$TAR_HANDLE_CACHE_SIZE" \
-  data.dataset.params.clone_cached_tensors=false \
-  data.dataset.params.max_clip_len_sec="$MAX_CLIP_LEN_SEC" \
-  data.dataset.params.strict_video_fps="$STRICT_VIDEO_FPS" \
-  data.dataset.params.strict_audio_fps="$STRICT_AUDIO_FPS" \
-  data.dataset.params.debug_io="$DEBUG_IO" \
-  data.dataset.params.profile_io="$PROFILE_IO" \
-  data.dataset.params.worker_threads=1 \
-  data.dataset.params.decode_threads=1 \
-  training.base_batch_size="$BATCH_SIZE" \
-  training.num_workers="$NUM_WORKERS" \
-  training.num_epochs="$NUM_EPOCHS" \
-  training.learning_rate="$LEARNING_RATE" \
-  training.persistent_workers="$PERSISTENT_WORKERS" \
-  training.prefetch_factor="$PREFETCH_FACTOR" \
-  training.pin_memory="$PIN_MEMORY" \
-  training.precision=amp \
-  training.for_loop_segment_fwd="$FOR_LOOP_SEGMENT_FWD" \
-  training.run_shifted_win_val="$RUN_SHIFTED_WIN_VAL" \
-  training.val_frequency="$VAL_FREQUENCY" \
-  data.n_segments_train="$N_SEGMENTS" \
-  data.n_segments_valid="$N_SEGMENTS" \
-  "$@"
+"${LAUNCH_CMD[@]}" "${PY_ARGS[@]}" -- "${CFG_OVERRIDES[@]}" "$@"
 status=$?
 set -e
 log "Training command exited with status $status"

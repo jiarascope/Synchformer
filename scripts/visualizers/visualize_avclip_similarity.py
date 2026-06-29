@@ -27,9 +27,17 @@ python scripts/visualizers/visualize_avclip_similarity.py \
   --video-dir /home/jiaray/mrBean/data/baseline_data/conducting_clips \
   --out /home/jiaray/mrBean/plots/baseline
 
+Multiple input video directories:
+  python scripts/visualizers/visualize_avclip_similarity.py \
+    --cfg /home/jiaray/mrBean/logs/synchformer_stage1_lora_wds_ddp/26-06-25T16-58-42/cfg-26-06-25T16-58-42.yaml \
+    --checkpoint /home/jiaray/mrBean/logs/synchformer_stage1_lora_wds_ddp/26-06-25T16-58-42/checkpoints/epoch_best.pt \
+    --video-dir /home/jiaray/mrBean/data/baseline_data/conductingValid_clips /home/jiaray/mrBean/data/baseline_data/youtubeclips/clips\
+    --out /home/jiaray/mrBean/plots/baseline/graphs/youtube+Valid_after
+
 """
 
 import argparse
+import csv
 import json
 import math
 import shutil
@@ -371,6 +379,94 @@ def similarities_from_features(vfeat: torch.Tensor, afeat: torch.Tensor) -> Dict
     }
 
 
+def score_v2a_alignment(v2a: torch.Tensor, temperature: float = 0.07) -> Dict[str, float]:
+    """
+    Score how much the Stage-1 v2a similarity matrix favors aligned pairs.
+
+    Assumes the clip is already aligned, so the expected match for visual segment i
+    is audio segment i. Larger values are better for every returned metric except
+    n_segments, which is metadata.
+
+    Primary metric used for ranking by default:
+      diag_margin = mean_i(sim[i, i] - max_{j != i} sim[i, j])
+
+    This is deliberately computed from the raw v2a matrix before heatmap scaling.
+    """
+    sim = v2a.detach().float().cpu()
+    if sim.ndim == 3 and sim.shape[0] == 1:
+        sim = sim[0]
+    if sim.ndim != 2:
+        raise ValueError(f"Expected a 2D v2a similarity matrix, got shape {tuple(sim.shape)}")
+
+    n = min(int(sim.shape[0]), int(sim.shape[1]))
+    if n <= 0:
+        raise ValueError("Cannot score an empty v2a similarity matrix.")
+    sim = sim[:n, :n]
+
+    target = torch.arange(n)
+    diag = sim.diag()
+    diag_mean = diag.mean()
+    row_acc = (sim.argmax(dim=1) == target).float().mean()
+
+    if n == 1:
+        # No off-diagonal competitor exists; fall back to raw diagonal strength.
+        diag_margin = diag_mean
+    else:
+        offdiag_mask = torch.eye(n, dtype=torch.bool)
+        offdiag_max = sim.masked_fill(offdiag_mask, float("-inf")).max(dim=1).values
+        diag_margin = (diag - offdiag_max).mean()
+
+    # Softmax diagonal probability is useful as a bounded diagnostic, but the
+    # absolute value depends on temperature; diag_margin is the default ranker.
+    row_probs = F.softmax(sim / float(temperature), dim=1)
+    diag_prob = row_probs[target, target].mean()
+
+    return {
+        "diag_margin": float(diag_margin.item()),
+        "diag_prob": float(diag_prob.item()),
+        "row_acc": float(row_acc.item()),
+        "diag_mean": float(diag_mean.item()),
+        "n_segments": float(n),
+    }
+
+
+def print_alignment_score(label: str, scores: Dict[str, float], metric: str) -> None:
+    score = scores[metric]
+    print(
+        f"Alignment score for {label}: "
+        f"{metric}={score:.6f}, "
+        f"diag_margin={scores['diag_margin']:.6f}, "
+        f"diag_prob={scores['diag_prob']:.6f}, "
+        f"row_acc={scores['row_acc']:.6f}, "
+        f"diag_mean={scores['diag_mean']:.6f}, "
+        f"n_segments={int(scores['n_segments'])}"
+    )
+
+
+def move_replace(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(exist_ok=True, parents=True)
+    if dst.exists():
+        dst.unlink()
+    src.rename(dst)
+
+
+def write_alignment_ranking_csv(records: Sequence[Dict], out_path: Path, metric: str) -> None:
+    out_path.parent.mkdir(exist_ok=True, parents=True)
+    metric_names = ["diag_margin", "diag_prob", "row_acc", "diag_mean", "n_segments"]
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["rank", "video", "plot", "npz", "rank_metric", *metric_names])
+        for rec in records:
+            writer.writerow([
+                rec["rank"],
+                rec["video_path"],
+                rec["final_plot_path"],
+                rec.get("final_npz_path") or "",
+                metric,
+                *(float(rec["scores"][name]) for name in metric_names),
+            ])
+
+
 def plot_matrices(
     mats: Dict[str, torch.Tensor],
     out_path: Path,
@@ -413,29 +509,65 @@ def plot_matrices(
     plt.close(fig)
 
 
-def collect_video_paths(vids: Optional[Iterable[str]], video_dir: Optional[str], pattern: str, recursive: bool) -> List[str]:
+def flatten_video_dirs(video_dirs) -> List[str]:
+    """Flatten argparse output for --video-dir.
+
+    Supports all of these forms:
+      --video-dir dir1
+      --video-dir dir1 dir2
+      --video-dir dir1 --video-dir dir2
+    """
+    if not video_dirs:
+        return []
+
+    flattened: List[str] = []
+    for item in video_dirs:
+        if item is None:
+            continue
+        if isinstance(item, (str, Path)):
+            flattened.append(str(item))
+        else:
+            flattened.extend(str(x) for x in item)
+    return flattened
+
+
+def collect_video_paths(vids: Optional[Iterable[str]], video_dirs, pattern: str, recursive: bool) -> List[str]:
     paths: List[Path] = []
 
     if vids:
         paths.extend(Path(v).expanduser().resolve() for v in vids)
 
-    if video_dir is not None:
+    for video_dir in flatten_video_dirs(video_dirs):
         root = Path(video_dir).expanduser().resolve()
         if not root.is_dir():
             raise FileNotFoundError(f"--video-dir is not a directory: {root}")
         iterator = root.rglob(pattern) if recursive else root.glob(pattern)
-        paths.extend(p.resolve() for p in iterator if p.is_file())
+        found = [p.resolve() for p in iterator if p.is_file()]
+        if not found:
+            print(f"Warning: no files matching {pattern!r} found in {root}")
+        paths.extend(found)
 
     deduped = sorted(dict.fromkeys(paths))
     if not deduped:
-        raise ValueError("No input videos found. Pass --vids or --video-dir with a matching --pattern.")
+        raise ValueError("No input videos found. Pass --vids or one or more --video-dir values with a matching --pattern.")
     return [str(p) for p in deduped]
 
 
-def make_safe_stem(path: str, index: int) -> str:
+def make_safe_video_stem(path: str) -> str:
+    """Return a filesystem-safe stem that starts with the source mp4 name."""
     stem = Path(path).stem
     safe = "".join(c if c.isalnum() or c in {"-", "_", "."} else "_" for c in stem)
-    return f"{index:04d}_{safe}"
+    return safe or "video"
+
+
+def make_safe_stem(path: str, index: int) -> str:
+    """Safe stem for temporary work paths; keep source name first for readability."""
+    return f"{make_safe_video_stem(path)}_{index:04d}"
+
+
+def make_ranked_similarity_stem(path: str, rank: int) -> str:
+    """Final ranked output stem, e.g. a_1_similaritymatrix."""
+    return f"{make_safe_video_stem(path)}_{rank}_similaritymatrix"
 
 
 def iter_transform_objects(obj, seen: Optional[set] = None):
@@ -617,7 +749,7 @@ def process_paths_as_long_video(
     npz_path: Optional[Path],
     work_dir: Path,
     group_label: str,
-):
+) -> Dict[str, float]:
     """Process one or more source videos using chunked full-length extraction."""
     chunk_seconds = float(args.effective_chunk_seconds)
     stride_seconds = args.stride_seconds if args.stride_seconds is not None else chunk_seconds
@@ -643,6 +775,8 @@ def process_paths_as_long_video(
         max_clips_per_forward=args.max_clips_per_forward,
     )
     mats = similarities_from_features(vfeat, afeat)
+    alignment_scores = score_v2a_alignment(mats["v2a"], temperature=args.alignment_temperature)
+    print_alignment_score(group_label, alignment_scores, args.alignment_score_metric)
 
     boundaries: List[int] = []
     if args.draw_chunk_boundaries:
@@ -676,8 +810,13 @@ def process_paths_as_long_video(
             source_video_for_chunk=np.array(source_video_for_chunk, dtype=np.int64),
             videos=np.array(list(paths), dtype=object),
             checkpoint=np.array([str(args.checkpoint)], dtype=object),
+            alignment_metric=np.array([args.alignment_score_metric], dtype=object),
+            alignment_scores_json=np.array([json.dumps(alignment_scores, sort_keys=True)], dtype=object),
+            **{f"alignment_{k}": np.array([v]) for k, v in alignment_scores.items()},
         )
         print(f"Saved raw matrices/features to {npz_path}")
+
+    return alignment_scores
 
 
 def process_paths_whole_video(
@@ -689,7 +828,7 @@ def process_paths_whole_video(
     plot_path: Path,
     npz_path: Optional[Path],
     work_dir: Path,
-):
+) -> Dict[str, float]:
     """Original single-window behavior retained behind --whole-video."""
     aud, vid, used_paths = build_batch(paths, cfg, device, reencode=not args.no_reencode, out_dir=work_dir)
     out = run_forward(model, vid, aud, cfg, amp=args.amp, device=device)
@@ -699,6 +838,9 @@ def process_paths_whole_video(
         "v2v": out["segment_sim_v2v"],
         "a2a": out["segment_sim_a2a"],
     }
+    alignment_scores = score_v2a_alignment(mats["v2a"], temperature=args.alignment_temperature)
+    print_alignment_score(", ".join(Path(p).name for p in used_paths), alignment_scores, args.alignment_score_metric)
+
     n_videos, n_segments = int(vid.shape[0]), int(vid.shape[1])
     boundaries = [b * n_segments for b in range(1, n_videos)]
     plot_matrices(
@@ -721,8 +863,13 @@ def process_paths_whole_video(
             n_segments=np.array([n_segments]),
             videos=np.array(used_paths, dtype=object),
             checkpoint=np.array([str(args.checkpoint)], dtype=object),
+            alignment_metric=np.array([args.alignment_score_metric], dtype=object),
+            alignment_scores_json=np.array([json.dumps(alignment_scores, sort_keys=True)], dtype=object),
+            **{f"alignment_{k}": np.array([v]) for k, v in alignment_scores.items()},
         )
         print(f"Saved raw matrices/features to {npz_path}")
+
+    return alignment_scores
 
 
 def main():
@@ -730,7 +877,7 @@ def main():
     parser.add_argument("--checkpoint", required=True, help="Path to a Stage-1 AVCLIP .pt checkpoint.")
     parser.add_argument("--cfg", default=None, help="Path to the matching cfg-*.yaml. If omitted, try checkpoint['args'].")
     parser.add_argument("--vids", nargs="+", default=None, help="One or more input .mp4 files.")
-    parser.add_argument("--video-dir", default=None, help="Directory containing .mp4 files to process.")
+    parser.add_argument("--video-dir", dest="video_dirs", nargs="+", action="append", default=None, help="One or more directories containing .mp4 files. Can be repeated, e.g. --video-dir dir1 dir2 or --video-dir dir1 --video-dir dir2.")
     parser.add_argument("--pattern", default="*.mp4", help="Glob pattern used with --video-dir. Default: *.mp4")
     parser.add_argument("--recursive", action="store_true", help="Search --video-dir recursively.")
     parser.add_argument("--combined", action="store_true", help="Plot all videos in one combined block matrix. Default: one PNG per video.")
@@ -748,10 +895,13 @@ def main():
     parser.add_argument("--max-clips-per-forward", type=int, default=8, help="Mini-batch size for chunk forward passes.")
     parser.add_argument("--draw-chunk-boundaries", action="store_true", help="Draw grid lines between chunks in the heatmaps.")
     parser.add_argument("--figsize", type=float, default=12.0, help="Matplotlib figure width/height in inches.")
+    parser.add_argument("--alignment-score-metric", choices=["diag_margin", "diag_prob", "row_acc", "diag_mean"], default="diag_margin", help="Metric used to rank independent videos. Default: diag_margin.")
+    parser.add_argument("--alignment-temperature", type=float, default=0.07, help="Temperature for the diagnostic diag_prob score. Does not affect diag_margin ranking.")
+    parser.add_argument("--ranking-csv", default=None, help="Optional CSV path for ranked alignment scores. Default: <out>/alignment_scores.csv for independent multi-video runs.")
     parser.add_argument("--keep-work", action="store_true", help="Keep temporary work/chunks/reencoded files instead of deleting them after a successful run.")
     args = parser.parse_args()
 
-    video_paths = collect_video_paths(args.vids, args.video_dir, args.pattern, args.recursive)
+    video_paths = collect_video_paths(args.vids, args.video_dirs, args.pattern, args.recursive)
 
     device = torch.device(args.device)
     ckpt, cfg = load_checkpoint_and_cfg(args.checkpoint, args.cfg)
@@ -792,20 +942,63 @@ def main():
                 else:
                     processor(video_paths, cfg, model, device, args, out_root, npz_path, work_dir, Path(video_paths[0]).name)
             else:
+                if out_is_file:
+                    raise ValueError("With multiple independent videos, --out must be an output directory, not a .png file.")
                 out_root.mkdir(exist_ok=True, parents=True)
                 npz_root = Path(args.npz).expanduser().resolve() if args.npz is not None else None
-                if npz_root is not None and npz_root.suffix.lower() != ".npz":
-                    npz_root.mkdir(exist_ok=True, parents=True)
+                if npz_root is not None:
+                    if len(video_paths) > 1 and npz_root.suffix.lower() == ".npz":
+                        raise ValueError("With multiple independent videos, --npz must be a directory, not a single .npz file.")
+                    if npz_root.suffix.lower() != ".npz":
+                        npz_root.mkdir(exist_ok=True, parents=True)
+
+                records: List[Dict] = []
                 for i, video_path in enumerate(video_paths):
-                    stem = make_safe_stem(video_path, i)
-                    plot_path = out_root / f"{stem}_similarity.png"
+                    temp_stem = f".tmp_{i:04d}_{make_safe_video_stem(video_path)}"
+                    plot_path = out_root / f"{temp_stem}_similaritymatrix.png"
                     npz_path = None
                     if npz_root is not None:
-                        npz_path = npz_root if (len(video_paths) == 1 and npz_root.suffix.lower() == ".npz") else npz_root / f"{stem}_similarity.npz"
+                        npz_path = npz_root if (len(video_paths) == 1 and npz_root.suffix.lower() == ".npz") else npz_root / f"{temp_stem}_similaritymatrix.npz"
+
                     if args.whole_video:
-                        processor([video_path], cfg, model, device, args, plot_path, npz_path, work_dir)
+                        scores = processor([video_path], cfg, model, device, args, plot_path, npz_path, work_dir)
                     else:
-                        processor([video_path], cfg, model, device, args, plot_path, npz_path, work_dir, Path(video_path).name)
+                        scores = processor([video_path], cfg, model, device, args, plot_path, npz_path, work_dir, Path(video_path).name)
+
+                    records.append({
+                        "video_path": video_path,
+                        "temp_plot_path": plot_path,
+                        "temp_npz_path": npz_path,
+                        "scores": scores,
+                        "score": float(scores[args.alignment_score_metric]),
+                    })
+
+                records.sort(key=lambda rec: rec["score"], reverse=True)
+                print("\nRanked clips by " + args.alignment_score_metric + " (higher is better):")
+                for rank, rec in enumerate(records, start=1):
+                    final_stem = make_ranked_similarity_stem(rec["video_path"], rank)
+                    final_plot_path = out_root / f"{final_stem}.png"
+                    move_replace(rec["temp_plot_path"], final_plot_path)
+                    rec["rank"] = rank
+                    rec["final_plot_path"] = final_plot_path
+
+                    final_npz_path = None
+                    if rec["temp_npz_path"] is not None:
+                        if npz_root is not None and npz_root.suffix.lower() == ".npz":
+                            final_npz_path = npz_root
+                        else:
+                            final_npz_path = npz_root / f"{final_stem}.npz"
+                        move_replace(rec["temp_npz_path"], final_npz_path)
+                    rec["final_npz_path"] = final_npz_path
+
+                    print(
+                        f"  {rank:>3}. {Path(rec['video_path']).name}  "
+                        f"{args.alignment_score_metric}={rec['score']:.6f}  ->  {final_plot_path.name}"
+                    )
+
+                ranking_csv = Path(args.ranking_csv).expanduser().resolve() if args.ranking_csv else out_root / "alignment_scores.csv"
+                write_alignment_ranking_csv(records, ranking_csv, args.alignment_score_metric)
+                print(f"Saved alignment ranking CSV to {ranking_csv}")
     finally:
         if not args.keep_work and work_dir.exists():
             shutil.rmtree(work_dir, ignore_errors=True)

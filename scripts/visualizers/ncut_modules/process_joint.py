@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Sequence
 
 import torch
 
@@ -17,25 +18,68 @@ from .process_common import (
 from .video_io import get_video_info, iter_videos
 
 
+def collect_joint_video_paths(video_dirs: Sequence[Path]):
+    """Collect videos from one or more directories, preserving first-seen order."""
+    video_paths = []
+    seen = set()
+
+    for video_dir in video_dirs:
+        for video_path in iter_videos(None, str(video_dir)):
+            resolved = Path(video_path).resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            video_paths.append(Path(video_path))
+
+    return video_paths
+
+
+def make_output_stems(video_paths: Sequence[Path]):
+    """Return per-video output stems without changing old names unless needed."""
+    stem_counts = {}
+    for video_path in video_paths:
+        stem_counts[video_path.stem] = stem_counts.get(video_path.stem, 0) + 1
+
+    output_stems = []
+    used = set()
+    for index, video_path in enumerate(video_paths):
+        if stem_counts[video_path.stem] == 1:
+            candidate = video_path.stem
+        else:
+            parent = video_path.parent.name or "video"
+            candidate = f"{parent}_{video_path.stem}"
+
+        if candidate in used:
+            candidate = f"{candidate}_{index:04d}"
+
+        used.add(candidate)
+        output_stems.append(candidate)
+
+    return output_stems
+
+
 def process_video_directory_joint_ncut(
-    video_dir: Path,
+    video_dirs: Sequence[Path],
     out_root: Path,
     visual_encoder: torch.nn.Module,
     device: torch.device,
     args: argparse.Namespace,
 ):
     """
-    Extract MotionFormer tokens from all videos in video_dir, concatenate them,
+    Extract MotionFormer tokens from all videos in video_dirs, concatenate them,
     run ONE NCut over all tokens, then write per-video shared-color overlays.
     """
     out_dir = out_root
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    video_paths = list(iter_videos(None, str(video_dir)))
+    video_paths = collect_joint_video_paths(video_dirs)
     if not video_paths:
-        raise RuntimeError(f"No videos found in: {video_dir}")
+        roots = ", ".join(str(video_dir) for video_dir in video_dirs)
+        raise RuntimeError(f"No videos found in: {roots}")
 
-    print(f"[joint] found {len(video_paths)} videos")
+    roots = ", ".join(str(video_dir) for video_dir in video_dirs)
+    print(f"[joint] found {len(video_paths)} videos across {len(video_dirs)} directories: {roots}")
+    output_stems = make_output_stems(video_paths)
 
     all_tokens = []
     records = []
@@ -47,6 +91,7 @@ def process_video_directory_joint_ncut(
     for vi, video_path in enumerate(video_paths):
         video_path = Path(video_path)
         stem = video_path.stem
+        output_stem = output_stems[vi]
 
         info = get_video_info(video_path)
         duration = effective_duration(info, args.max_duration_sec)
@@ -68,6 +113,7 @@ def process_video_directory_joint_ncut(
                 "video_index": vi,
                 "video_path": str(video_path),
                 "video_stem": stem,
+                "output_stem": output_stem,
                 "video_info": info,
             },
             initial_token_offset=token_offset,
@@ -106,6 +152,7 @@ def process_video_directory_joint_ncut(
     for video_path_str, video_records in by_video.items():
         video_path = Path(video_path_str)
         stem = video_path.stem
+        output_stem = video_records[0].get("output_stem", stem)
 
         info = video_records[0]["video_info"]
         video_fps = info["fps"]
@@ -123,7 +170,7 @@ def process_video_directory_joint_ncut(
 
         write_held_mask_overlay_video(
             video_path=video_path,
-            rgb_out_path=out_dir / f"{stem}_joint_{args.embedding_map}_rgb_overlay.mp4",
+            rgb_out_path=out_dir / f"{output_stem}_joint_{args.embedding_map}_rgb_overlay.mp4",
             rgb_mask_accum=rgb_mask_accum,
             mask_count=mask_count,
             video_fps=video_fps,
