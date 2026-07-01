@@ -8,9 +8,9 @@ videos in an input directory and writes only mp4 overlay videos to `--out_dir`.
 ```bash
 python3 /home/jiaray/mrBean/Synchformer/scripts/visualizers/ncut_video.py \
   --repo_root /home/jiaray/mrBean/Synchformer \
-  --checkpoint /home/jiaray/mrBean/logs/synchformer_stage1_lora_wds_ddp/26-06-25T16-58-42/checkpoints/epoch_best.pt \
-  --video_dir /home/jiaray/mrBean/data/baseline_data/conductingValid_clips  \
-  --out_dir /home/jiaray/mrBean/plots/naiive/youtubeclips \
+  --checkpoint /home/jiaray/mrBean/Synchformer/checkpoints/segment_avclip/synchformer_avclip_audioset.pt \
+  --video_dir /home/jiaray/mrBean/data/baseline_data/conductingTraining_clips  \
+  --out_dir /home/jiaray/mrBean/plots/baseline/conductingTraining_clips/50ev_umap \
   --embedding_map umap \
   --segment_sec 0.64 \
   --stride_sec 0.32 \

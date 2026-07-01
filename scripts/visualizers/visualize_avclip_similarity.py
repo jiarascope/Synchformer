@@ -29,10 +29,16 @@ python scripts/visualizers/visualize_avclip_similarity.py \
 
 Multiple input video directories:
   python scripts/visualizers/visualize_avclip_similarity.py \
-    --cfg /home/jiaray/mrBean/logs/synchformer_stage1_lora_wds_ddp/26-06-25T16-58-42/cfg-26-06-25T16-58-42.yaml \
+  --cfg configs/segment_avclip.yaml \
+  --checkpoint checkpoints/segment_avclip/synchformer_avclip_audioset.pt \
+    --video-dir /home/jiaray/mrBean/data/baseline_data/conductingTraining_clips \
+    --out /home/jiaray/mrBean/plots/baseline/graphs/conductingTraining_clips/50ev_umap
+
+
+
+ --cfg /home/jiaray/mrBean/logs/synchformer_stage1_lora_wds_ddp/26-06-25T16-58-42/cfg-26-06-25T16-58-42.yaml \
     --checkpoint /home/jiaray/mrBean/logs/synchformer_stage1_lora_wds_ddp/26-06-25T16-58-42/checkpoints/epoch_best.pt \
-    --video-dir /home/jiaray/mrBean/data/baseline_data/conductingValid_clips /home/jiaray/mrBean/data/baseline_data/youtubeclips/clips\
-    --out /home/jiaray/mrBean/plots/baseline/graphs/youtube+Valid_after
+
 
 """
 
